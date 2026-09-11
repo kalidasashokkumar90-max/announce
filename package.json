@@ -1,0 +1,16 @@
+{
+  "name": "socialfeed",
+  "version": "1.0.0",
+  "description": "A Facebook-style social feed. Browse without an account; sign up to post, like and comment.",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "multer": "^2.0.2",
+    "bcryptjs": "^2.4.3"
+  }
+}
