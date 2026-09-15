@@ -70,6 +70,9 @@ if (process.env.APP_ORIGIN) ALLOWED_ORIGINS.add(String(process.env.APP_ORIGIN).r
 // its origin is also trusted for same-origin checks.
 const APP_URL = String(process.env.APP_URL || `http://localhost:${PORT}`).replace(/\/+$/, '');
 try { ALLOWED_ORIGINS.add(new URL(APP_URL).origin); } catch {}
+// Uploaded files live in a separate directory so deployments with ephemeral
+// filesystems (e.g. Railway) can point UPLOAD_DIR at a persistent volume.
+const uploadDir = process.env.UPLOAD_DIR || path.join(__dirname, 'public', 'uploads');
 function originAllowed(rawOrigin) {
   try {
     return ALLOWED_ORIGINS.has(new URL(String(rawOrigin)).origin);
@@ -95,7 +98,7 @@ app.use(express.json());
 // No-cache for static assets: theme/CSS changes must reach the browser
 // immediately (versioned ?v= is a belt-and-braces backup).
 app.use(express.static(path.join(__dirname, 'public'), { etag: false, maxAge: 0, setHeaders: (res) => res.setHeader('Cache-Control', 'no-store') }));
-app.use('/uploads', express.static(path.join(__dirname, 'public', 'uploads')));
+app.use('/uploads', express.static(uploadDir));
 
 const SESSION_SECRET = (() => {
   // Never silently fall back to a world-known value. In production booting
@@ -599,7 +602,6 @@ function deleteUserData(userId) {
   }
 }
 
-const uploadDir = path.join(__dirname, 'public', 'uploads');
 fs.mkdirSync(uploadDir, { recursive: true });
 
 // Uploads are buffered in memory so the real image format is verified from
