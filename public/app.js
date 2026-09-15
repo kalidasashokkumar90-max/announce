@@ -10,6 +10,9 @@ const state = {
   notifications: [],
   notificationsUnread: 0,
   notifPollTimer: null,
+  feedTopId: null,      // id of the newest post on the rendered feed
+  newPostCount: 0,      // new posts detected since the feed was rendered
+  feedPollTimer: null,
 };
 
 // ---------- Helpers ----------
@@ -621,6 +624,7 @@ function renderAuth() {
       await fetch('/api/logout', { method: 'POST' });
       state.me = null;
       stopNotifPoll();
+      stopFeedPoll();
       closePanels();
       renderAuth();
       goFeed();
@@ -704,6 +708,38 @@ async function renderNotifPanel() {
 let authMode = 'login';
 const authOverlay = $('#auth-overlay');
 
+// Runtime config (/api/config): whether Google sign-in is enabled on the
+// server, and whether demo accounts exist. Fetched once, cached for the page.
+let appConfig = null;
+const configPromise = api('/api/config')
+  .then((c) => { appConfig = c; return c; })
+  .catch(() => { appConfig = {}; });
+
+// Renders the "Continue with Google" button (only when the server is
+// configured for it) and the demo-credentials hint (only when demo accounts
+// actually exist — fresh and production DBs never print them).
+function renderAuthSocial() {
+  const wrap = $('#auth-social');
+  const hint = $('#auth-demo-hint');
+  const cfg = appConfig || {};
+  if (cfg.google && cfg.google.enabled) {
+    wrap.innerHTML = `<div class="auth-divider"><span>or</span></div>
+      <button type="button" class="btn btn-google btn-block" id="google-btn" aria-label="Continue with Google">
+        <svg width="16" height="16" viewBox="0 0 48 48" aria-hidden="true"><path fill="#FFC107" d="M43.6 20.1H42V20H24v8h11.3C33.7 32.7 29.2 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.9 1.2 8 3l5.7-5.7C34.3 6.4 29.4 4 24 4 13 4 4 13 4 24s9 20 20 20 20-9 20-20c0-1.3-.1-2.7-.4-3.9z"/><path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.7 15.1 19 12 24 12c3.1 0 5.9 1.2 8 3l5.7-5.7C34.3 6.4 29.4 4 24 4 16.3 4 9.7 8.3 6.3 14.7z"/><path fill="#4CAF50" d="M24 44c5.2 0 10-2 13.6-5.2l-6.3-5.3C29.2 35.1 26.7 36 24 36c-5.2 0-9.6-3.3-11.3-8l-6.5 5C9.5 39.6 16.2 44 24 44z"/><path fill="#1976D2" d="M43.6 20.1H42V20H24v8h11.3c-.8 2.3-2.3 4.3-4.1 5.7.1-.1 6.3 5 6.3 5C34.2 42.1 40 40 40 32c0-1.3-.1-2.7-.3-3.9.3-.1 0-5.8 3.9-8z"/></svg>
+        Continue with Google
+      </button>`;
+    $('#google-btn').addEventListener('click', () => { window.location.href = '/api/auth/google'; });
+  } else {
+    wrap.innerHTML = '';
+  }
+  if (cfg.demo && cfg.demo === true) {
+    hint.textContent = 'Demo accounts: alya@demo.com · rohan@demo.com · cafe@demo.com — any with password demo123';
+    hint.classList.remove('hidden');
+  } else {
+    hint.classList.add('hidden');
+  }
+}
+
 function openAuth(mode = 'login') {
   authMode = mode;
   $('#auth-title').textContent = mode === 'login' ? 'Welcome back' : 'Create your account';
@@ -720,6 +756,7 @@ function openAuth(mode = 'login') {
   $('#auth-password').value = '';
   $('#auth-name').value = '';
   $('#auth-skills').value = '';
+  configPromise.then(renderAuthSocial);
   setTimeout(() => $('#auth-email').focus(), 50);
 }
 
@@ -828,19 +865,21 @@ async function loadFeed() {
   app.innerHTML = '<div class="spinner">Loading feed...</div>';
   try {
     const feedQuery = feedTab === 'following' ? '?feed=following' : '';
-    const [postsData, jobsData, suggestionsData] = await Promise.all([
+    const [postsData, jobsData, suggestionsData, activityData] = await Promise.all([
       api('/api/posts' + feedQuery),
       api('/api/jobs'),
       api('/api/users/suggestions?limit=8').catch(() => ({ users: [] })),
+      api('/api/activity').catch(() => ({ milestones: [] })),
     ]);
     const sug = (suggestionsData && (suggestionsData.users || suggestionsData.suggestions)) || [];
-    renderFeed(postsData.posts, jobsData.jobs, sug);
+    const milestones = (activityData && activityData.milestones) || [];
+    renderFeed(postsData.posts, jobsData.jobs, sug, milestones);
   } catch (e) {
     app.innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`;
   }
 }
 
-function renderFeed(posts, jobs, suggestions) {
+function renderFeed(posts, jobs, suggestions, milestones) {
   renderLeftSidebar(posts, jobs);
   renderRightSidebar(posts, jobs);
 
@@ -851,13 +890,20 @@ function renderFeed(posts, jobs, suggestions) {
   const postCards = posts.length
     ? posts.map(postHtml).join('')
     : (feedTab === 'following' ? '<div class="empty">You\'re not following anyone with posts yet. Check out “For you”.</div>' : '');
-  const list = [jobCards, postCards].filter(Boolean).join('') || '<div class="empty">Nothing here yet. Be the first to share something!</div>';
+  const mileCards = (milestones || []).map(milestoneCardHtml).join('');
+  const nudge = state.me && !state.me.photo ? nudgeCardHtml() : '';
+  const list = [mileCards, jobCards, nudge, postCards].filter(Boolean).join('')
+    || '<div class="empty">Nothing here yet. Be the first to share something!</div>';
 
-  app.innerHTML = fab + storiesHtml(posts, jobs) + feedPillsHtml() + suggestionsHtml(suggestions) + list;
+  state.feedTopId = posts[0] ? posts[0].id : null;
+  state.newPostCount = 0;
+
+  app.innerHTML = fab + storiesHtml(posts, jobs) + newPostsPillHtml() + feedPillsHtml() + suggestionsHtml(suggestions) + list;
   const fabBtn = $('#fab-new-post');
   if (fabBtn) fabBtn.addEventListener('click', showComposer);
   bindFeed();
   bindJobCards(document);
+  bindMilestoneCards(document);
   document.querySelectorAll('.story[data-goprofile]').forEach((el) => {
     el.addEventListener('click', () => goProfile(Number(el.dataset.goprofile)));
   });
@@ -867,7 +913,95 @@ function renderFeed(posts, jobs, suggestions) {
       if (c) c.remove();
     });
   });
+  const npBtn = $('#new-posts-btn');
+  if (npBtn) npBtn.addEventListener('click', () => {
+    state.newPostCount = 0;
+    goFeed();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  });
+  const nudgeBtn = $('#nudge-add-photo');
+  if (nudgeBtn) nudgeBtn.addEventListener('click', () => {
+    if (!state.me) return showGotcha('Create an account to add a portfolio photo.');
+    goProfile(state.me.id);
+  });
   bindSidebars();
+  startFeedPoll();
+}
+
+function newPostsPillHtml() {
+  return `
+    <div class="new-posts-pill" aria-live="polite">
+      <button type="button" id="new-posts-btn" class="${state.newPostCount > 0 ? 'show' : ''}">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+        <span id="new-posts-label">${state.newPostCount} new post${state.newPostCount === 1 ? '' : 's'}</span>
+      </button>
+    </div>`;
+}
+
+function milestoneCardHtml(m) {
+  return `
+    <div class="card feed-stagger" data-milestone="${m.id}" data-giver="${m.giver.id}">
+      <div class="milestone">
+        <div class="milestone-icon">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>
+        </div>
+        <div>
+          <p><b>${escapeHtml(m.seeker.name)}</b> just got hired — <b>${escapeHtml(m.job.title)}</b> for <a href="#" class="post-author" data-user="${m.giver.id}">${escapeHtml(m.giver.name)}</a></p>
+          <div class="stars">★★★★★ <span>${timeAgo(m.createdAt)}</span></div>
+        </div>
+      </div>
+    </div>`;
+}
+
+function nudgeCardHtml() {
+  return `
+    <div class="card nudge feed-stagger">
+      <div class="nudge-icon">📸</div>
+      <div>
+        <h4>Add a portfolio photo</h4>
+        <p>Job-givers pick workers with photos 2× more often.</p>
+      </div>
+      <button class="nudge-btn" id="nudge-add-photo">Add now</button>
+    </div>`;
+}
+
+function bindMilestoneCards(scope) {
+  scope.querySelectorAll('.card[data-milestone]').forEach((card) => {
+    card.addEventListener('click', (e) => {
+      if (e.target.closest('a, button')) return;
+      const giverId = Number(card.dataset.giver);
+      if (giverId) goProfile(giverId);
+    });
+  });
+}
+
+function startFeedPoll() {
+  clearInterval(state.feedPollTimer);
+  state.feedPollTimer = setInterval(async () => {
+    if (state.currentView !== 'feed' || !state.feedTopId) return;
+    try {
+      const data = await api('/api/posts');
+      const posts = data.posts || [];
+      const top = posts[0] && posts[0].id;
+      if (top > state.feedTopId) {
+        state.newPostCount = Math.max(state.newPostCount, posts.filter((p) => p.id > state.feedTopId).length || 1);
+        updateNewPostsPill();
+      }
+    } catch (e) { /* transient — next tick retries */ }
+  }, 15000);
+}
+
+function stopFeedPoll() {
+  clearInterval(state.feedPollTimer);
+  state.feedPollTimer = null;
+}
+
+function updateNewPostsPill() {
+  const btn = $('#new-posts-btn');
+  if (!btn) return;
+  btn.classList.add('show');
+  const label = $('#new-posts-label');
+  if (label) label.textContent = `${state.newPostCount} new post${state.newPostCount === 1 ? '' : 's'}`;
 }
 
 function storiesHtml(posts, jobs) {
@@ -1640,10 +1774,14 @@ function chatMsgHtml(m) {
     // Server message objects carry `attachment` (a URL string); uploads return { url, name }.
     const attachUrl = String(m.attachment);
     const fname = m.attachmentName || attachmentDisplayName(attachUrl);
-    if (/\.(png|jpe?g|gif|webp|bmp|svg)(\?|#|$)/i.test(attachUrl)) {
-      attachmentHtml = `<div class="chat-attachment"><img src="${escapeHtml(attachUrl)}" alt="${escapeHtml(fname)}" onclick="showLightbox('${escapeHtml(attachUrl)}')" /></div>`;
+    // Only server-issued /uploads/ images render as images. No inline event
+    // handlers (stored-XSS breakout via a crafted attachment URL): lightbox
+    // opens through delegated data-lightbox clicks instead.
+    const isLocalImage = /^\/uploads\/.+\.(png|jpe?g|gif|webp|avif|bmp)(\?|$)/i.test(attachUrl);
+    if (isLocalImage) {
+      attachmentHtml = `<div class="chat-attachment"><img src="${escapeHtml(attachUrl)}" alt="${escapeHtml(fname)}" data-lightbox="${escapeHtml(attachUrl)}" class="chat-thumb" /></div>`;
     } else {
-      attachmentHtml = `<div class="chat-attachment"><a class="file-link" href="${escapeHtml(attachUrl)}" target="_blank" rel="noopener">📎 ${escapeHtml(fname)}</a></div>`;
+      attachmentHtml = `<div class="chat-attachment"><a class="file-link" href="${escapeHtml(attachUrl)}" target="_blank" rel="noopener noreferrer">📎 ${escapeHtml(fname)}</a></div>`;
     }
   }
 
@@ -1891,6 +2029,15 @@ async function openChat(userId) {
 
     // Message actions delegation
     msgBox.addEventListener('click', (e) => {
+      // Lightbox for attachment images (rendered with data-lightbox, never
+      // inline handlers — prevents stored-XSS breakout via crafted URLs).
+      const lightboxTarget = e.target.closest('[data-lightbox]');
+      if (lightboxTarget) {
+        const src = lightboxTarget.dataset.lightbox;
+        if (/^\/uploads\/.+\.(png|jpe?g|gif|webp|avif|bmp)(\?|$)/i.test(src)) showLightbox(src);
+        return;
+      }
+
       // Reaction picker toggle
       const reactionPicker = e.target.closest('.msg-reaction-picker button');
       if (reactionPicker) {
@@ -3678,4 +3825,10 @@ document.addEventListener('click', (e) => {
   renderAuth();
   goFeed();
   if (state.me) pollNotifications();
+  configPromise.then(() => {
+    // OAuth round-trip landing sites (redirected from the Google callback).
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('google') === 'ok') toast('Signed in with Google — welcome!');
+    else if (params.get('google') === 'failed') toast('Google sign-in failed. Please try again.');
+  });
 })();

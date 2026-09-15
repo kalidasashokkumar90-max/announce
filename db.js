@@ -25,6 +25,8 @@ db.exec(`
     theme      TEXT NOT NULL DEFAULT '',
     notifyPrefs TEXT NOT NULL DEFAULT '{}',
     privateProfile INTEGER NOT NULL DEFAULT 0,
+    googleId   TEXT,
+    isAdmin    INTEGER NOT NULL DEFAULT 0,
     online     INTEGER NOT NULL DEFAULT 0,
     lastSeen   TEXT DEFAULT '',
     createdAt  TEXT NOT NULL
@@ -198,6 +200,11 @@ ensureColumn('users', 'location', `location TEXT NOT NULL DEFAULT ''`);
 ensureColumn('users', 'theme', `theme TEXT NOT NULL DEFAULT ''`);
 ensureColumn('users', 'notifyPrefs', `notifyPrefs TEXT NOT NULL DEFAULT '{}'`);
 ensureColumn('users', 'privateProfile', `privateProfile INTEGER NOT NULL DEFAULT 0`);
+ensureColumn('users', 'googleId', `googleId TEXT`);
+ensureColumn('users', 'isAdmin', `isAdmin INTEGER NOT NULL DEFAULT 0`);
+// Partial unique index: NULL/'' googleId values are exempt so password users
+// never collide, while real Google sub ids stay unique.
+db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_googleId ON users(googleId) WHERE googleId IS NOT NULL AND googleId != ''`);
 
 // messages + conversations — columns added after the original tables shipped.
 ensureColumn('messages', 'replyToId', `replyToId INTEGER REFERENCES messages(id) ON DELETE SET NULL`);

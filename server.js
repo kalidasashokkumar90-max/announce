@@ -13,7 +13,24 @@ const { seed } = require('./seed');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-seed();
+// Demo seed only for local, non-production, freshly-created databases. The
+// seed data itself (demo accounts with a known password) must never reach a
+// production DB, and SKIP_SEED always turns it off explicitly.
+if (process.env.NODE_ENV !== 'production' && process.env.SKIP_SEED !== '1') seed();
+
+// ---- One-time data migrations ---------------------------------------------
+// Tracked by name in app_migrations so each migration runs exactly once.
+db.exec(`CREATE TABLE IF NOT EXISTS app_migrations (name TEXT PRIMARY KEY, appliedAt TEXT)`);
+function migration(name, fn) {
+  if (db.prepare('SELECT 1 FROM app_migrations WHERE name = ?').get(name)) return;
+  fn();
+  db.prepare('INSERT INTO app_migrations (name, appliedAt) VALUES (?, ?)').run(name, new Date().toISOString());
+}
+// The old block routes stored (Math.min, Math.max) of the two ids, which
+// silently inverted which user is the blocker. Enforced directionally, that
+// let the blocked person keep messaging the blocker. Direction is
+// unrecoverable from the row, so start the table clean once per DB.
+migration('fix-block-direction', () => { db.exec('DELETE FROM blocks'); });
 
 // Security headers via helmet:
 //  - CSP allows Leaflet (unpkg.com) for the SPA's map and blocks framing the app.
@@ -26,15 +43,14 @@ app.use(
       useDefaults: false,
       directives: {
         'default-src': ["'self'"],
-        // Leaflet + the SPA itself are the only script sources; inline handlers
-        // and eval are refused so a stored-XSS payload can't run.
-        'script-src': ["'self'", 'https://unpkg.com'],
-        // Critical: 'unsafe-inline' is intentionally NOT present for style-src-attr
-        // defaults; allow style attributes only where the SPA injects them.
-        'style-src': ["'self'", 'https://unpkg.com', 'https://fonts.googleapis.com'],
+        // Leaflet is self-hosted in /vendor so no third-party script sources
+        // are needed; inline handlers and eval stay refused. connect-src allows
+        // 'self' plus the geocoding endpoint the SPA legitimately calls.
+        'script-src': ["'self'"],
+        'style-src': ["'self'", 'https://fonts.googleapis.com'],
         'font-src': ["'self'", 'https://fonts.gstatic.com', 'data:'],
-        'img-src': ["'self'", 'data:', 'blob:', 'https://unpkg.com', 'https://*.basemaps.cartocdn.com', 'https://*.tile.openstreetmap.org'],
-        'connect-src': ["'self'"],
+        'img-src': ["'self'", 'data:', 'blob:', 'https://*.basemaps.cartocdn.com', 'https://*.tile.openstreetmap.org'],
+        'connect-src': ["'self'", 'https://nominatim.openstreetmap.org'],
         'object-src': ["'none'"],
         'base-uri': ["'self'"],
         'frame-ancestors': ["'none'"],
@@ -50,12 +66,19 @@ app.disable('x-powered-by');
 // Origin/Referer that does not match the app's own origin is rejected with 403.
 const ALLOWED_ORIGINS = new Set(['http://localhost:3000']);
 if (process.env.APP_ORIGIN) ALLOWED_ORIGINS.add(String(process.env.APP_ORIGIN).replace(/\/+$/, ''));
+// APP_URL is the canonical external origin (used for Google OAuth redirects);
+// its origin is also trusted for same-origin checks.
+const APP_URL = String(process.env.APP_URL || `http://localhost:${PORT}`).replace(/\/+$/, '');
+try { ALLOWED_ORIGINS.add(new URL(APP_URL).origin); } catch {}
 function originAllowed(rawOrigin) {
   try {
     return ALLOWED_ORIGINS.has(new URL(String(rawOrigin)).origin);
   } catch { return false; }
 }
 app.use('/api', (req, res, next) => {
+  // Private/personalized JSON must never be cached by a shared cache or an
+  // intermediary (CWE-524). Reject any cross-origin state-changing request.
+  res.setHeader('Cache-Control', 'no-store');
   if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return next();
   const origin = req.headers.origin;
   const referer = req.headers.referer;
@@ -75,15 +98,66 @@ app.use(express.static(path.join(__dirname, 'public'), { etag: false, maxAge: 0,
 app.use('/uploads', express.static(path.join(__dirname, 'public', 'uploads')));
 
 const SESSION_SECRET = (() => {
-  // Hard block in production: run with a real secret or refuse to boot.
-  // 'dev-secret-change-me' is HMAC'd into every session cookie — shipping a
-  // known public value lets an attacker forge sessions for any account.
+  // Never silently fall back to a world-known value. In production booting
+  // without a real secret is a hard error; in dev it needs an explicit
+  // ALLOW_DEV_SESSION_SECRET=1 acknowledgement so no one ships the placeholder.
   const configured = process.env.SESSION_SECRET;
-  if (process.env.NODE_ENV === 'production' && (!configured || configured === 'dev-secret-change-me' || configured === 'dev-secret-change-me-v2')) {
-    throw new Error('SESSION_SECRET must be set to a strong unique value in production (and not the dev placeholder). Refusing to start with a forgeable session secret.');
+  if (configured && configured !== 'dev-secret-change-me' && configured !== 'dev-secret-change-me-v2') {
+    return configured;
   }
-  return configured || 'dev-secret-change-me';
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('SESSION_SECRET must be set to a strong unique value in production. Refusing to start with a forgeable session secret.');
+  }
+  if (process.env.ALLOW_DEV_SESSION_SECRET !== '1') {
+    throw new Error('SESSION_SECRET is not set. For local development set SESSION_SECRET to a random value, or set ALLOW_DEV_SESSION_SECRET=1 (never use this for anything public).');
+  }
+  return 'dev-secret-change-me';
 })();
+// Over HTTPS the session cookie gets Secure + SameSite=Strict so it can never
+// be sniffed on plain HTTP or minted by a cross-site request.
+const secureCookies = process.env.NODE_ENV === 'production' || /^https:\/\//i.test(String(process.env.APP_ORIGIN || APP_URL));
+function sessionCookie(value, maxAgeSeconds) {
+  const sameSite = secureCookies ? 'Strict' : 'Lax';
+  return `sid=${value}; HttpOnly; Path=/; ${maxAgeSeconds ? 'Max-Age=' + maxAgeSeconds + '; ' : ''}SameSite=${sameSite}${secureCookies ? '; Secure' : ''}`;
+}
+function currentSessionToken(req) {
+  const m = (req.headers.cookie || '').match(/(?:^|;\s*)sid=([^;]+)/);
+  return m ? m[1].split('.')[0] : null;
+}
+// Password changes are only meaningful if old sessions die with the old
+// password. Kills every session for the user except the one in the browser
+// that just changed the password.
+function invalidateOtherSessions(userId, keepToken) {
+  for (const [token, sess] of [...sessions.entries()]) {
+    if (sess && sess.userId === userId && token !== keepToken) sessions.delete(token);
+  }
+}
+
+// ---- Google Sign-In (free OAuth 2.0) --------------------------------------
+// Set GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET in env (get them free from the
+// Google Cloud console; add APP_URL to your Google "Authorized redirect URIs"
+// as <APP_URL>/api/auth/google/callback). When unset the feature is disabled
+// and the UI simply hides the button.
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
+const GOOGLE_REDIRECT_URI = `${APP_URL}/api/auth/google/callback`;
+
+// CSRF guard state for the OAuth round-trip (one-time, 10-minute expiry).
+const googleStates = new Map();
+function makeGoogleState() {
+  const s = crypto.randomBytes(16).toString('hex');
+  googleStates.set(s, Date.now());
+  return s;
+}
+function decodeJwtPayload(token) {
+  try {
+    const b64 = String(token || '').split('.')[1];
+    if (!b64) return null;
+    const url = b64.replace(/-/g, '+').replace(/_/g, '/');
+    const pad = '='.repeat((4 - (url.length % 4)) % 4);
+    return JSON.parse(Buffer.from(url + pad, 'base64').toString('utf8'));
+  } catch (e) { return null; }
+}
 const sessions = new Map();
 
 // Brute-force guard for authentication endpoints. A session cookie is only as
@@ -113,6 +187,35 @@ const socialLimiter = rateLimit({
   message: { error: 'Too many requests. Please slow down and try again shortly.' },
 });
 
+// Messaging is per-user sensitive and spam-safe only when throttled: reply,
+// forward, star, pin, react, typing and read all share this budget.
+const messageLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 200,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Too many message requests. Please slow down and try again shortly.' },
+});
+
+// Uploads write bytes to disk — unlimited uploads mean disk exhaustion. A
+// per-IP budget stops flood abuse without hurting normal use.
+const uploadLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 30,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Too many uploads. Please try again shortly.' },
+});
+
+// /api/search runs a live LIKE over users/jobs per keystroke.
+const searchLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 600,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Too many searches. Please try again shortly.' },
+});
+
 function sign(data) {
   return data + '.' + crypto.createHmac('sha256', SESSION_SECRET).update(data).digest('hex');
 }
@@ -122,10 +225,10 @@ function setSession(res, userId) {
   // userId read (sess.userId) work. Previously the raw id was stored and every
   // authenticated request resolved to "anonymous".
   sessions.set(token, { userId, expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000 });
-  res.setHeader('Set-Cookie', `sid=${sign(token)}; HttpOnly; Path=/; Max-Age=604800; SameSite=Lax`);
+  res.setHeader('Set-Cookie', sessionCookie(sign(token), 604800));
 }
 function clearSession(res) {
-  res.setHeader('Set-Cookie', 'sid=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax');
+  res.setHeader('Set-Cookie', sessionCookie('', 0).replace('Max-Age=0', 'Max-Age=0'));
 }
 function getUserId(req) {
   const cookie = req.headers.cookie || '';
@@ -289,27 +392,41 @@ function reactionSummaries(postIds, viewerId) {
 }
 
 // Resolves the "sharedFrom" originals for a set of feed rows in one query.
-function sharedOriginals(rows) {
+// Originals authored by a private-profile account are omitted unless the
+// viewer is that author (sharing must not expose private posts).
+function sharedOriginals(rows, viewerId) {
   const out = new Map();
   const ids = [...new Set(rows.map((r) => r.shareOfId).filter(Boolean))];
   if (!ids.length) return out;
   const marks = ids.map(() => '?').join(',');
   const originals = db.prepare(`
-    SELECT p.id, p.body, u.id AS authorId, u.name AS authorName, u.photo AS authorPhoto
+    SELECT p.id, p.body, u.id AS authorId, u.name AS authorName, u.photo AS authorPhoto, u.privateProfile AS authorPrivate
     FROM posts p JOIN users u ON u.id = p.authorId
     WHERE p.id IN (${marks})
   `).all(...ids);
-  for (const o of originals) out.set(o.id, o);
+  const viewerNum = viewerId != null ? Number(viewerId) : null;
+  for (const o of originals) {
+    if (o.authorPrivate && viewerNum !== Number(o.authorId)) continue;
+    out.set(o.id, o);
+  }
   return out;
 }
 
 // Shared feed loader — every feed/list endpoint routes through this so the
 // post JSON shape is identical. `me` is bound twice (likedByMe + savedByMe in
 // POST_SELECT) before any endpoint-supplied WHERE arguments.
+//
+// Privacy: posts by a private-profile author are only visible to that author
+// themselves. Guests and other members never see them in feeds, tag pages,
+// following feeds or saved views — the privateProfile promise is enforced
+// everywhere, not just on the profile page.
 function loadPosts(me, whereSql, whereArgs, orderSql) {
-  const rows = db.prepare(POST_SELECT + (whereSql ? ' ' + whereSql : '') + ' ' + (orderSql || 'ORDER BY p.createdAt DESC')).all(me, me, ...(whereArgs || []));
+  const meId = me != null ? Number(me) : null;
+  const visibility = meId ? ' AND (u.privateProfile = 0 OR p.authorId = ?)' : ' AND u.privateProfile = 0';
+  const visibilityArgs = meId ? [meId] : [];
+  const rows = db.prepare(POST_SELECT + (whereSql ? ' ' + whereSql : '') + visibility + ' ' + (orderSql || 'ORDER BY p.createdAt DESC')).all(me, me, ...(whereArgs || []), ...visibilityArgs);
   const reactions = reactionSummaries(rows.map((r) => r.id), me);
-  const originals = sharedOriginals(rows);
+  const originals = sharedOriginals(rows, me);
   return rows.map((r) => serializePost(r, reactions, originals));
 }
 
@@ -387,9 +504,35 @@ function getOrCreateConversation(userId, otherId) {
 
 function isBlocked(by, of) {
   // Blocks are directional: (blockerId, blockedId) rows store who blocked whom.
-  // A blocking B must NOT be treated as B blocking A (that alternated min/max
-  // "both ways" bug let a blocked user keep messaging the blocker).
   return !!db.prepare('SELECT id FROM blocks WHERE blockerId = ? AND blockedId = ?').get(by, of);
+}
+
+// True when either party blocked the other (you cannot message someone you
+// blocked, nor someone who blocked you — the direction is preserved now).
+function isEitherBlocked(a, b) {
+  return isBlocked(a, b) || isBlocked(b, a);
+}
+
+// A message, only if `userId` is a participant of the conversation it lives
+// in. Every route that addresses a message by id MUST pass through this guard
+// or it becomes an IDOR (enumeration lets anyone read/toggle anyone's DMs).
+function messageForUser(messageId, userId) {
+  return db.prepare(`
+    SELECT m.* FROM messages m
+    JOIN conversations c ON c.id = m.conversationId
+    WHERE m.id = ? AND (c.userA = ? OR c.userB = ?)
+  `).get(Number(messageId), Number(userId), Number(userId));
+}
+
+// Removes an uploaded file from disk if it is a legitimate /uploads/ URL.
+// Path traversal is impossible: the URL is validated and only the basename is
+// used to join against the upload directory.
+function deleteUploadFile(url) {
+  if (typeof url !== 'string' || !/^\/uploads\/[A-Za-z0-9._-]+$/.test(url)) return;
+  try {
+    const abs = path.join(uploadDir, path.basename(url));
+    if (fs.existsSync(abs)) fs.unlinkSync(abs);
+  } catch (e) { /* best-effort cleanup */ }
 }
 
 // Deletes every row that references a user in one transaction. The schema's
@@ -438,6 +581,15 @@ function deleteUserData(userId) {
     db.prepare('DELETE FROM notifications WHERE userId = ? OR actorId = ?').run(userId, userId);
     // Block relationships.
     db.prepare('DELETE FROM blocks WHERE blockerId = ? OR blockedId = ?').run(userId, userId);
+    // Uploaded files owned by the account (profile photo, post images,
+    // message attachments) so deleted accounts don't leave orphaned bytes on
+    // disk that keep getting served from /uploads.
+    const fileUrls = [];
+    const prof = db.prepare('SELECT photo FROM users WHERE id = ?').get(userId);
+    if (prof && prof.photo) fileUrls.push(prof.photo);
+    for (const p of db.prepare('SELECT image FROM posts WHERE authorId = ?').all(userId)) if (p.image) fileUrls.push(p.image);
+    for (const m of db.prepare('SELECT attachment FROM messages WHERE senderId = ?').all(userId)) if (m.attachment) fileUrls.push(m.attachment);
+    fileUrls.forEach(deleteUploadFile);
     // Finally the user row itself — the whole deletion is one atomic transaction.
     db.prepare('DELETE FROM users WHERE id = ?').run(userId);
     db.exec('COMMIT');
@@ -449,27 +601,70 @@ function deleteUserData(userId) {
 
 const uploadDir = path.join(__dirname, 'public', 'uploads');
 fs.mkdirSync(uploadDir, { recursive: true });
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadDir),
-  filename: (req, file, cb) => {
-    // SECURITY: extension must be derived from the validated MIME type, NOT
-    // from client-controlled file.originalname. originalname-based extensions
-    // allowed .html/.svg uploads that became stored-XSS sinks.
-    const ext = ({ 'image/jpeg': '.jpg', 'image/png': '.png', 'image/gif': '.gif', 'image/webp': '.webp', 'image/avif': '.avif' })[file.mimetype] || file.mimetype === 'image/svg+xml' ? fallbackExt(file) : (file.mimetypeMap && file.mimetypeMap[file.mimetype]) || '.jpg';
-    cb(null, Date.now() + '-' + crypto.randomBytes(6).toString('hex') + ext);
-  },
-});
-// Whitelist: raster image formats only. SVG/HTML are REJECTED (XSS vectors).
+
+// Uploads are buffered in memory so the real image format is verified from
+// magic bytes BEFORE anything touches disk. The client-supplied MIME type is
+// only used for an early cheap filter; the extension and the actual write are
+// decided by what the file really is. SVG/HTML never reach the whitelist.
 const ALLOWED_MIME = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/avif']);
-function fallbackExt(file) { return '.bin'; }
 const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     if (ALLOWED_MIME.has(file.mimetype)) return cb(null, true);
     cb(new Error('Unsupported file type. Only JPG, PNG, GIF, WebP, and AVIF images are allowed.'));
   },
 });
+
+// Matches the leading magic bytes of each allowed raster format. Returns the
+// on-disk extension or null when the bytes look like something else (HTML,
+// SVG, polyglots, executables...). GIF is "GIF8"; JPEG is FF D8 FF; PNG has
+// the 8-byte signature; WebP is "RIFF...WEBP"; AVIF is an ISO-BMFF box whose
+// major brand is avif/avis.
+function imageExtFromMagic(buf) {
+  if (!buf || buf.length < 12) return null;
+  if (buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) return 'jpg';
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47 && buf[4] === 0x0D && buf[5] === 0x0A && buf[6] === 0x1A && buf[7] === 0x0A) return 'png';
+  if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38) return 'gif';
+  if (buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46 && buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50) return 'webp';
+  if (buf[4] === 0x66 && buf[5] === 0x74 && buf[6] === 0x79 && buf[7] === 0x70) {
+    const brand = String.fromCharCode(buf[8], buf[9], buf[10], buf[11]);
+    if (brand === 'avif' || brand === 'avis') return 'avif';
+  }
+  return null;
+}
+
+// Per-user disk budget for this process. Keeps a single user from filling the
+// disk through the (deliberately open) upload endpoints.
+const uploadQuota = new Map(); // userId -> total bytes written this process
+const UPLOAD_QUOTA_BYTES = 50 * 1024 * 1024;
+function chargeUploadQuota(userId, bytes) {
+  const used = uploadQuota.get(userId) || 0;
+  if (used + bytes > UPLOAD_QUOTA_BYTES) return false;
+  uploadQuota.set(userId, used + bytes);
+  return true;
+}
+
+// Validates + writes an upload and returns the public URL, or sends the error
+// response and returns null. Routes must `return` when it returns null.
+function saveValidatedUpload(req, res, userId) {
+  if (!req.file) {
+    res.status(400).json({ error: 'No file uploaded.' });
+    return null;
+  }
+  if (!chargeUploadQuota(Number(userId) || 0, req.file.size)) {
+    res.status(413).json({ error: 'Upload quota reached for this session. Delete old images and try again.' });
+    return null;
+  }
+  const ext = imageExtFromMagic(req.file.buffer);
+  if (!ext) {
+    res.status(400).json({ error: 'The file contents do not match an allowed image (JPG, PNG, GIF, WebP, AVIF).' });
+    return null;
+  }
+  const filename = Date.now() + '-' + crypto.randomBytes(8).toString('hex') + '.' + ext;
+  fs.writeFileSync(path.join(uploadDir, filename), req.file.buffer, { flag: 'wx' });
+  return '/uploads/' + filename;
+}
 
 // ---- Auth ----
 app.post('/api/signup', authLimiter, async (req, res) => {
@@ -501,11 +696,78 @@ app.post('/api/login', authLimiter, (req, res) => {
 app.post('/api/logout', (req, res) => {
   const me = getUserId(req);
   if (me) db.prepare('UPDATE users SET online = 0, lastSeen = ? WHERE id = ?').run(now(), me);
-  const cookie = req.headers.cookie || '';
-  const m = cookie.match(/(?:^|;\s*)sid=([^;]+)/);
-  if (m) sessions.delete(m[1].split('.')[0]);
+  const token = currentSessionToken(req);
+  if (token) sessions.delete(token);
   clearSession(res);
   res.json({ ok: true });
+});
+
+// ---- Google OAuth ---------------------------------------------------------
+app.get('/api/auth/google', (req, res) => {
+  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
+    return res.status(403).json({ error: 'Google sign-in is not configured on this server.' });
+  }
+  const state = makeGoogleState();
+  const params = new URLSearchParams({
+    client_id: GOOGLE_CLIENT_ID,
+    redirect_uri: GOOGLE_REDIRECT_URI,
+    response_type: 'code',
+    scope: 'openid email profile',
+    state,
+    prompt: 'select_account',
+  });
+  res.redirect('https://accounts.google.com/o/oauth2/v2/auth?' + params.toString());
+});
+
+app.get('/api/auth/google/callback', async (req, res) => {
+  const { code, state, error } = req.query;
+  const issuedAt = googleStates.get(String(state || ''));
+  googleStates.delete(String(state || ''));
+  if (error) return res.redirect(APP_URL + '/?google=failed');
+  if (!issuedAt || Date.now() - issuedAt > 10 * 60 * 1000) return res.redirect(APP_URL + '/?google=failed');
+  if (!code) return res.redirect(APP_URL + '/?google=failed');
+  try {
+    const tok = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code: String(code),
+        client_id: GOOGLE_CLIENT_ID,
+        client_secret: GOOGLE_CLIENT_SECRET,
+        redirect_uri: GOOGLE_REDIRECT_URI,
+        grant_type: 'authorization_code',
+      }),
+    }).then((r) => r.json());
+    const info = decodeJwtPayload(tok.id_token);
+    // Validate the token was minted for OUR client and that the email is
+    // verified — otherwise any forged id_token could sign into any account.
+    if (!info || info.aud !== GOOGLE_CLIENT_ID || info.email_verified !== true || !info.sub || !info.email) {
+      return res.redirect(APP_URL + '/?google=failed');
+    }
+    const email = String(info.email).toLowerCase();
+    let user = db.prepare('SELECT * FROM users WHERE googleId = ?').get(info.sub);
+    if (!user) user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+    if (!user) {
+      const insert = db.prepare('INSERT INTO users (name, email, password, role, googleId, bio, skills, location, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(String(info.name || 'Google User'), email, '', 'member', info.sub, '', '', '', now());
+      user = db.prepare('SELECT * FROM users WHERE id = ?').get(insert.lastInsertRowid);
+    } else if (!user.googleId) {
+      // Existing password account with the same email: link the Google id so
+      // future sign-ins match, and keep the password login working too.
+      db.prepare('UPDATE users SET googleId = ? WHERE id = ?').run(info.sub, user.id);
+    }
+    setSession(res, user.id);
+    db.prepare('UPDATE users SET online = 1, lastSeen = ? WHERE id = ?').run(now(), user.id);
+    return res.redirect(APP_URL + '/?google=ok');
+  } catch (e) {
+    return res.redirect(APP_URL + '/?google=failed');
+  }
+});
+
+// Minimal runtime config the SPA needs (Google button visibility, demo hint).
+app.get('/api/config', (req, res) => {
+  const demo = db.prepare("SELECT COUNT(*) AS c FROM users WHERE email LIKE '%@demo.com'").get().c > 0;
+  res.json({ google: { enabled: !!GOOGLE_CLIENT_ID && !!GOOGLE_CLIENT_SECRET }, demo });
 });
 
 app.get('/api/me', (req, res) => {
@@ -585,6 +847,8 @@ app.post('/api/me/password', (req, res) => {
     return res.status(400).json({ error: 'New password must be at least 8 characters.' });
   }
   db.prepare('UPDATE users SET password = ? WHERE id = ?').run(bcrypt.hashSync(String(password), 10), me);
+  // Any other session using the old password must die now (CWE-613).
+  invalidateOtherSessions(me, currentSessionToken(req));
   res.json({ ok: true });
 });
 
@@ -643,14 +907,16 @@ app.post('/api/posts', socialLimiter, (req, res) => {
   res.json({ id: info.lastInsertRowid });
 });
 
-app.post('/api/posts/:id/image', upload.single('image'), (req, res) => {
+app.post('/api/posts/:id/image', uploadLimiter, upload.single('image'), (req, res) => {
   const me = getUserId(req); if (!me) return res.status(401).json({ error: 'Please sign in.' });
   const post = db.prepare('SELECT * FROM posts WHERE id = ?').get(Number(req.params.id));
   if (!post) return res.status(404).json({ error: 'Post not found.' });
   if (post.authorId !== me) return res.status(403).json({ error: 'Not your post.' });
-  if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
-  db.prepare('UPDATE posts SET image = ? WHERE id = ?').run('/uploads/' + req.file.filename, post.id);
-  res.json({ image: '/uploads/' + req.file.filename });
+  const url = saveValidatedUpload(req, res, me);
+  if (!url) return;
+  if (post.image) deleteUploadFile(post.image);
+  db.prepare('UPDATE posts SET image = ? WHERE id = ?').run(url, post.id);
+  res.json({ image: url });
 });
 
 app.put('/api/posts/:id', (req, res) => {
@@ -670,6 +936,7 @@ app.delete('/api/posts/:id/image', (req, res) => {
   const post = db.prepare('SELECT * FROM posts WHERE id = ?').get(Number(req.params.id));
   if (!post) return res.status(404).json({ error: 'Post not found.' });
   if (post.authorId !== me) return res.status(403).json({ error: 'Not your post.' });
+  if (post.image) deleteUploadFile(post.image);
   db.prepare('UPDATE posts SET image = ? WHERE id = ?').run('', post.id);
   res.json({ ok: true });
 });
@@ -679,12 +946,13 @@ app.delete('/api/posts/:id', (req, res) => {
   const post = db.prepare('SELECT * FROM posts WHERE id = ?').get(Number(req.params.id));
   if (!post) return res.status(404).json({ error: 'Post not found.' });
   if (post.authorId !== me) return res.status(403).json({ error: 'Not your post.' });
+  if (post.image) deleteUploadFile(post.image);
   db.prepare('DELETE FROM posts WHERE id = ?').run(post.id);
   res.json({ ok: true });
 });
 
 // ---- Likes ----
-app.post('/api/posts/:id/like', (req, res) => {
+app.post('/api/posts/:id/like', socialLimiter, (req, res) => {
   const me = getUserId(req); if (!me) return res.status(401).json({ error: 'Please sign in.' });
   const post = db.prepare('SELECT id, authorId FROM posts WHERE id = ?').get(Number(req.params.id));
   if (!post) return res.status(404).json({ error: 'Post not found.' });
@@ -693,7 +961,7 @@ app.post('/api/posts/:id/like', (req, res) => {
   const count = db.prepare('SELECT COUNT(*) AS c FROM likes WHERE postId = ?').get(post.id).c;
   res.json({ liked: info.changes > 0, likeCount: count });
 });
-app.post('/api/posts/:id/unlike', (req, res) => {
+app.post('/api/posts/:id/unlike', socialLimiter, (req, res) => {
   const me = getUserId(req); if (!me) return res.status(401).json({ error: 'Please sign in.' });
   db.prepare('DELETE FROM likes WHERE postId = ? AND userId = ?').run(Number(req.params.id), me);
   const count = db.prepare('SELECT COUNT(*) AS c FROM likes WHERE postId = ?').get(Number(req.params.id)).c;
@@ -812,15 +1080,18 @@ app.delete('/api/comments/:id', (req, res) => {
   if (!comment) return res.status(404).json({ error: 'Comment not found.' });
   const post = db.prepare('SELECT authorId FROM posts WHERE id = ?').get(comment.postId);
   if (!post) return res.status(404).json({ error: 'Post not found.' });
-  const viewer = db.prepare('SELECT role FROM users WHERE id = ?').get(me);
-  const allowed = comment.authorId === me || post.authorId === me || (viewer && viewer.role === 'owner');
+  const viewer = db.prepare('SELECT isAdmin FROM users WHERE id = ?').get(me);
+  // 'owner' is the BUSINESS account type here, NOT a moderator role. Global
+  // comment moderation is gated on the separate isAdmin flag so no business
+  // account can silently delete anyone's criticism.
+  const allowed = comment.authorId === me || post.authorId === me || (viewer && viewer.isAdmin === 1);
   if (!allowed) return res.status(403).json({ error: 'You are not allowed to delete this comment.' });
   db.prepare('DELETE FROM comments WHERE id = ?').run(comment.id);
   res.json({ ok: true });
 });
 
 // ---- Search ----
-app.get('/api/search', (req, res) => {
+app.get('/api/search', searchLimiter, (req, res) => {
   const q = String(req.query.q || '').trim(); const type = String(req.query.type || 'people');
   if (!q) return res.json({ results: [] });
   const like = '%' + q.replace(/[%_]/g, (c) => '\\' + c) + '%';
@@ -892,7 +1163,7 @@ app.get('/api/users/:id', (req, res) => {
       user: { id: user.id, name: user.name, photo: user.photo || '', role: user.role, private: true },
       postCount: 0, likesReceived: 0, commentsReceived: 0, openJobs: 0, jobsDone: 0,
       posts: [],
-      blocked: me ? isBlocked(user.id, me) : false,
+      blocked: me ? isBlocked(me, user.id) : false,
       followersCount: counts.followersCount, followingCount: counts.followingCount, isFollowing: following,
     });
   }
@@ -915,6 +1186,7 @@ app.patch('/api/users/:id', (req, res) => {
   const { name, bio, skills, location, email, password, currentPassword, theme, notifyPrefs, privateProfile } = req.body || {};
   const sets = [];
   const args = [];
+  let pendingPasswordChange = false;
 
   // name
   if (name !== undefined) {
@@ -957,6 +1229,7 @@ app.patch('/api/users/:id', (req, res) => {
       return res.status(400).json({ error: 'New password must be at least 8 characters.' });
     }
     sets.push('password = ?'); args.push(bcrypt.hashSync(String(password), 10));
+    pendingPasswordChange = true;
   }
   // theme
   if (theme !== undefined) {
@@ -980,16 +1253,20 @@ app.patch('/api/users/:id', (req, res) => {
     args.push(me);
     db.prepare('UPDATE users SET ' + sets.join(', ') + ' WHERE id = ?').run(...args);
   }
+  // Password change via PATCH must also invalidate other sessions.
+  if (pendingPasswordChange) invalidateOtherSessions(me, currentSessionToken(req));
   const updated = db.prepare('SELECT * FROM users WHERE id = ?').get(me);
   res.json({ user: selfUser(updated) });
 });
-app.post('/api/users/:id/photo', upload.single('photo'), (req, res) => {
+app.post('/api/users/:id/photo', uploadLimiter, upload.single('photo'), (req, res) => {
   const me = getUserId(req); if (!me) return res.status(401).json({ error: 'Please sign in.' });
   if (me !== Number(req.params.id)) return res.status(403).json({ error: 'Not your profile.' });
-  if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
-  const photo = '/uploads/' + req.file.filename;
-  db.prepare('UPDATE users SET photo = ? WHERE id = ?').run(photo, me);
-  res.json({ photo });
+  const url = saveValidatedUpload(req, res, me);
+  if (!url) return;
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(me);
+  if (user && user.photo) deleteUploadFile(user.photo);
+  db.prepare('UPDATE users SET photo = ? WHERE id = ?').run(url, me);
+  res.json({ photo: url });
 });
 
 // ---- Follows ----
@@ -1016,18 +1293,21 @@ app.delete('/api/users/:id/follow', (req, res) => {
 });
 
 // ---- Block/Unblock ----
-app.post('/api/users/:id/block', (req, res) => {
+// Directional on purpose: (me, targetId) records that THIS user blocked that
+// user. The old code stored Math.min/max, which silently inverted the block
+// and let the blocked party still message the blocker.
+app.post('/api/users/:id/block', socialLimiter, (req, res) => {
   const me = getUserId(req); if (!me) return res.status(401).json({ error: 'Please sign in.' });
   const targetId = Number(req.params.id); if (targetId === me) return res.status(400).json({ error: 'Cannot block yourself.' });
-  const a = Math.min(me, targetId), b = Math.max(me, targetId);
-  db.prepare('INSERT OR IGNORE INTO blocks (blockerId, blockedId, createdAt) VALUES (?, ?, ?)').run(a, b, now());
+  const target = db.prepare('SELECT id FROM users WHERE id = ?').get(targetId);
+  if (!target) return res.status(404).json({ error: 'User not found.' });
+  db.prepare('INSERT OR IGNORE INTO blocks (blockerId, blockedId, createdAt) VALUES (?, ?, ?)').run(me, targetId, now());
   res.json({ ok: true });
 });
 app.post('/api/users/:id/unblock', (req, res) => {
   const me = getUserId(req); if (!me) return res.status(401).json({ error: 'Please sign in.' });
   const targetId = Number(req.params.id);
-  const a = Math.min(me, targetId), b = Math.max(me, targetId);
-  db.prepare('DELETE FROM blocks WHERE blockerId = ? AND blockedId = ?').run(a, b);
+  db.prepare('DELETE FROM blocks WHERE blockerId = ? AND blockedId = ?').run(me, targetId);
   res.json({ ok: true });
 });
 
@@ -1088,7 +1368,7 @@ app.get('/api/jobs/:id/applications', (req, res) => {
   res.json({ applications: rows.map((a) => ({ id: a.id, message: a.message, status: a.status, createdAt: a.createdAt, seeker: { id: a.seekerId, name: a.seekerName, photo: a.seekerPhoto, bio: a.seekerBio, skills: (a.seekerSkills || '').split(',').map((s) => s.trim()).filter(Boolean) } })) });
 });
 
-app.post('/api/jobs/:id/apply', (req, res) => {
+app.post('/api/jobs/:id/apply', socialLimiter, (req, res) => {
   const me = getUserId(req); if (!me) return res.status(401).json({ error: 'Please sign in to apply.' });
   const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(Number(req.params.id));
   if (!job) return res.status(404).json({ error: 'Job not found.' });
@@ -1129,7 +1409,36 @@ app.get('/api/my/jobs', (req, res) => {
   res.json({ jobs: rows.map((j) => ({ ...serializeJob(j), giver: { id: me }, applicantCount: j.applicantCount })) });
 });
 
-// ---- Events ----
+// ---- Activity (feed milestones) ----
+// Recent hires feed the milestone cards on the home feed. Public read — the
+// milestone is a lightweight social proof strip ("X got hired for Y"), no
+// contact details or PII beyond names/photos the app already shows on cards.
+app.get('/api/activity', (req, res) => {
+  const rows = db.prepare(`
+    SELECT a.id, a.createdAt,
+           j.id AS jobId, j.title AS jobTitle, j.category AS jobCategory, j.filled AS jobFilled,
+           g.id AS giverId, g.name AS giverName, g.photo AS giverPhoto,
+           s.id AS seekerId, s.name AS seekerName, s.photo AS seekerPhoto
+    FROM applications a
+    JOIN jobs j ON j.id = a.jobId
+    JOIN users g ON g.id = j.giverId
+    JOIN users s ON s.id = a.seekerId
+    WHERE a.status = 'accepted'
+      AND g.privateProfile = 0 AND s.privateProfile = 0
+    ORDER BY a.createdAt DESC
+    LIMIT 4
+  `).all();
+  res.json({
+    milestones: rows.map((r) => ({
+      id: r.id,
+      createdAt: r.createdAt,
+      job: { id: r.jobId, title: r.jobTitle, category: r.jobCategory, filled: !!r.jobFilled },
+      giver: { id: r.giverId, name: r.giverName, photo: r.giverPhoto },
+      seeker: { id: r.seekerId, name: r.seekerName, photo: r.seekerPhoto },
+    })),
+  });
+});
+
 app.get('/api/events', (req, res) => {
   const me = getUserId(req);
   const rows = db.prepare(EVENT_SELECT + ' ORDER BY e.startAt ASC').all(me);
@@ -1218,7 +1527,7 @@ app.get('/api/messages/:userId', (req, res) => {
   if (!otherId || otherId === me) return res.status(400).json({ error: 'Invalid user.' });
   const other = db.prepare('SELECT id, name, photo, online, lastSeen FROM users WHERE id = ?').get(otherId);
   if (!other) return res.status(404).json({ error: 'User not found.' });
-  if (isBlocked(me, otherId)) return res.status(403).json({ error: 'You have been blocked by this user.' });
+  if (isEitherBlocked(me, otherId)) return res.status(403).json({ error: 'You have been blocked by this user.' });
   const convoId = getOrCreateConversation(me, otherId);
   const rows = db.prepare(`SELECT m.*, u.name AS senderName, u.photo AS senderPhoto FROM messages m JOIN users u ON u.id = m.senderId WHERE m.conversationId = ? ORDER BY m.createdAt ASC`).all(convoId);
 
@@ -1227,12 +1536,12 @@ app.get('/api/messages/:userId', (req, res) => {
   const messages = rows.map((m) => {
     let replyTo = null;
     if (m.replyToId) {
-      const rt = db.prepare('SELECT rm.id, rm.body, rm.senderId, rm.deleted, u.name AS senderName FROM messages rm JOIN users u ON u.id = rm.senderId WHERE rm.id = ?').get(m.replyToId);
+      const rt = db.prepare('SELECT rm.id, rm.body, rm.senderId, rm.deleted, u.name AS senderName FROM messages rm JOIN users u ON u.id = rm.senderId WHERE rm.id = ? AND rm.conversationId = ?').get(m.replyToId, convoId);
       if (rt) replyTo = { id: rt.id, body: rt.deleted ? 'Message deleted' : rt.body, senderName: rt.senderName };
     }
     let forwardedFrom = null;
     if (m.forwardedId) {
-      const fw = db.prepare('SELECT rm.body, rm.deleted, u.name AS senderName FROM messages rm JOIN users u ON u.id = rm.senderId WHERE rm.id = ?').get(m.forwardedId);
+      const fw = db.prepare('SELECT rm.body, rm.deleted, u.name AS senderName FROM messages rm JOIN users u ON u.id = rm.senderId WHERE rm.id = ? AND rm.conversationId = ?').get(m.forwardedId, convoId);
       if (fw) forwardedFrom = { body: fw.deleted ? 'Message deleted' : fw.body, senderName: fw.senderName };
     }
     const reactions = db.prepare('SELECT mr.emoji, mr.userId, u.name AS userName FROM message_reactions mr JOIN users u ON u.id = mr.userId WHERE mr.messageId = ?').all(m.id);
@@ -1248,22 +1557,40 @@ app.get('/api/messages/:userId', (req, res) => {
 });
 
 // Send message
-app.post('/api/messages/:userId', (req, res) => {
+app.post('/api/messages/:userId', messageLimiter, (req, res) => {
   const me = getUserId(req); if (!me) return res.status(401).json({ error: 'Please sign in.' });
   const otherId = Number(req.params.userId);
   if (!otherId || otherId === me) return res.status(400).json({ error: 'Invalid user.' });
-  if (isBlocked(me, otherId)) return res.status(403).json({ error: 'Cannot send messages to this user.' });
+  if (isEitherBlocked(me, otherId)) return res.status(403).json({ error: 'Cannot send messages to this user.' });
   const { body, replyToId, forwardedId, attachment } = req.body || {};
   if (!body && !attachment) return res.status(400).json({ error: 'Message cannot be empty.' });
+  // Attachments must be server-issued upload URLs — never arbitrary strings.
+  // This blocks javascript:/data: URLs and stored-HTML payloads in the sink
+  // that renders chat attachments.
+  if (attachment && typeof attachment === 'string' && !/^\/uploads\/[A-Za-z0-9._-]+$/.test(attachment)) {
+    return res.status(400).json({ error: 'Invalid attachment.' });
+  }
   const convoId = getOrCreateConversation(me, otherId);
-  const info = db.prepare('INSERT INTO messages (conversationId, senderId, body, replyToId, forwardedId, attachment, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)').run(convoId, me, String(body || '').trim(), replyToId || null, forwardedId || null, attachment || '', now());
+  const replyId = replyToId != null && String(replyToId).trim() !== '' ? Number(replyToId) : null;
+  const fwId = forwardedId != null && String(forwardedId).trim() !== '' ? Number(forwardedId) : null;
+  // reply/forward targets must live in THIS conversation — un-scoped lookups
+  // let anyone echo any message on the platform by bruteforcing its id (IDOR).
+  if (replyId) {
+    const rt = db.prepare('SELECT id FROM messages WHERE id = ? AND conversationId = ?').get(replyId, convoId);
+    if (!rt) return res.status(400).json({ error: 'Reply target is not in this conversation.' });
+  }
+  if (fwId) {
+    const fw = db.prepare('SELECT id FROM messages WHERE id = ? AND conversationId = ?').get(fwId, convoId);
+    if (!fw) return res.status(400).json({ error: 'Forwarded message is not in this conversation.' });
+  }
+  const info = db.prepare('INSERT INTO messages (conversationId, senderId, body, replyToId, forwardedId, attachment, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)').run(convoId, me, String(body || '').trim(), replyId, fwId, typeof attachment === 'string' ? attachment : '', now());
   const actor = db.prepare('SELECT name FROM users WHERE id = ?').get(me);
   notify(otherId, me, 'message', convoId, (actor ? actor.name : 'Someone') + ' sent you a message.', '/messages');
   const msg = db.prepare('SELECT m.*, u.name AS senderName, u.photo AS senderPhoto FROM messages m JOIN users u ON u.id = m.senderId WHERE m.id = ?').get(info.lastInsertRowid);
   let replyTo = null;
-  if (msg.replyToId) { const rt = db.prepare('SELECT rm.id, rm.body, rm.senderId, rm.deleted, u.name AS senderName FROM messages rm JOIN users u ON u.id = rm.senderId WHERE rm.id = ?').get(msg.replyToId); if (rt) replyTo = { id: rt.id, body: rt.deleted ? 'Message deleted' : rt.body, senderName: rt.senderName }; }
+  if (msg.replyToId) { const rt = db.prepare('SELECT rm.id, rm.body, rm.senderId, rm.deleted, u.name AS senderName FROM messages rm JOIN users u ON u.id = rm.senderId WHERE rm.id = ? AND rm.conversationId = ?').get(msg.replyToId, convoId); if (rt) replyTo = { id: rt.id, body: rt.deleted ? 'Message deleted' : rt.body, senderName: rt.senderName }; }
   let forwardedFrom = null;
-  if (msg.forwardedId) { const fw = db.prepare('SELECT rm.body, rm.deleted, u.name AS senderName FROM messages rm JOIN users u ON u.id = rm.senderId WHERE rm.id = ?').get(msg.forwardedId); if (fw) forwardedFrom = { body: fw.deleted ? 'Message deleted' : fw.body, senderName: fw.senderName }; }
+  if (msg.forwardedId) { const fw = db.prepare('SELECT rm.body, rm.deleted, u.name AS senderName FROM messages rm JOIN users u ON u.id = rm.senderId WHERE rm.id = ? AND rm.conversationId = ?').get(msg.forwardedId, convoId); if (fw) forwardedFrom = { body: fw.deleted ? 'Message deleted' : fw.body, senderName: fw.senderName }; }
   res.json({ message: { id: msg.id, body: msg.body, attachment: msg.attachment, createdAt: msg.createdAt, replyTo, forwardedFrom, reactions: [], sender: { id: msg.senderId, name: msg.senderName, photo: msg.senderPhoto } } });
 });
 
@@ -1292,9 +1619,9 @@ app.delete('/api/messages/:id', (req, res) => {
 });
 
 // Star/unstar message
-app.post('/api/messages/:id/star', (req, res) => {
+app.post('/api/messages/:id/star', messageLimiter, (req, res) => {
   const me = getUserId(req); if (!me) return res.status(401).json({ error: 'Please sign in.' });
-  const msg = db.prepare('SELECT * FROM messages WHERE id = ?').get(Number(req.params.id));
+  const msg = messageForUser(Number(req.params.id), me);
   if (!msg) return res.status(404).json({ error: 'Message not found.' });
   const newVal = msg.starred ? 0 : 1;
   db.prepare('UPDATE messages SET starred = ? WHERE id = ?').run(newVal, msg.id);
@@ -1302,9 +1629,9 @@ app.post('/api/messages/:id/star', (req, res) => {
 });
 
 // Pin/unpin message
-app.post('/api/messages/:id/pin', (req, res) => {
+app.post('/api/messages/:id/pin', messageLimiter, (req, res) => {
   const me = getUserId(req); if (!me) return res.status(401).json({ error: 'Please sign in.' });
-  const msg = db.prepare('SELECT * FROM messages WHERE id = ?').get(Number(req.params.id));
+  const msg = messageForUser(Number(req.params.id), me);
   if (!msg) return res.status(404).json({ error: 'Message not found.' });
   const newVal = msg.pinned ? 0 : 1;
   db.prepare('UPDATE messages SET pinned = ? WHERE id = ?').run(newVal, msg.id);
@@ -1312,9 +1639,10 @@ app.post('/api/messages/:id/pin', (req, res) => {
 });
 
 // React to message
-app.post('/api/messages/:id/react', (req, res) => {
+app.post('/api/messages/:id/react', messageLimiter, (req, res) => {
   const me = getUserId(req); if (!me) return res.status(401).json({ error: 'Please sign in.' });
   const msgId = Number(req.params.id);
+  if (!messageForUser(msgId, me)) return res.status(404).json({ error: 'Message not found.' });
   const { emoji } = req.body || {};
   if (!emoji) return res.status(400).json({ error: 'Emoji required.' });
   const existing = db.prepare('SELECT id FROM message_reactions WHERE messageId = ? AND userId = ? AND emoji = ?').get(msgId, me, emoji);
@@ -1328,12 +1656,14 @@ app.post('/api/messages/:id/react', (req, res) => {
 });
 
 // Forward message
-app.post('/api/messages/:id/forward', (req, res) => {
+app.post('/api/messages/:id/forward', messageLimiter, (req, res) => {
   const me = getUserId(req); if (!me) return res.status(401).json({ error: 'Please sign in.' });
   const msgId = Number(req.params.id);
   const { toUserId } = req.body || {};
   if (!toUserId) return res.status(400).json({ error: 'Target user required.' });
-  const orig = db.prepare('SELECT * FROM messages WHERE id = ?').get(msgId);
+  // Only messages the sender is a participant of can be forwarded — otherwise
+  // forwarding becomes an exfiltration oracle for other people's DMs.
+  const orig = messageForUser(msgId, me);
   if (!orig) return res.status(404).json({ error: 'Message not found.' });
   const convoId = getOrCreateConversation(me, Number(toUserId));
   const info = db.prepare('INSERT INTO messages (conversationId, senderId, body, forwardedId, createdAt) VALUES (?, ?, ?, ?, ?)').run(convoId, me, orig.body, orig.id, now());
@@ -1353,7 +1683,7 @@ app.get('/api/messages/:userId/search', (req, res) => {
 });
 
 // Typing indicator (simple POST endpoint)
-app.post('/api/messages/:userId/typing', (req, res) => {
+app.post('/api/messages/:userId/typing', messageLimiter, (req, res) => {
   const me = getUserId(req); if (!me) return res.status(401).json({ error: 'Please sign in.' });
   const otherId = Number(req.params.userId);
   const { typing } = req.body || {};
@@ -1363,7 +1693,7 @@ app.post('/api/messages/:userId/typing', (req, res) => {
 });
 
 // Mark conversation as read
-app.post('/api/messages/:userId/read', (req, res) => {
+app.post('/api/messages/:userId/read', messageLimiter, (req, res) => {
   const me = getUserId(req); if (!me) return res.status(401).json({ error: 'Please sign in.' });
   const otherId = Number(req.params.userId);
   const convoId = getOrCreateConversation(me, otherId);
@@ -1372,7 +1702,7 @@ app.post('/api/messages/:userId/read', (req, res) => {
 });
 
 // Toggle mute conversation
-app.post('/api/messages/:userId/mute', (req, res) => {
+app.post('/api/messages/:userId/mute', messageLimiter, (req, res) => {
   const me = getUserId(req); if (!me) return res.status(401).json({ error: 'Please sign in.' });
   const otherId = Number(req.params.userId);
   const convoId = getOrCreateConversation(me, otherId);
@@ -1392,10 +1722,11 @@ app.get('/api/messages/:userId/starred', (req, res) => {
 });
 
 // File upload for messages
-app.post('/api/upload', upload.single('file'), (req, res) => {
+app.post('/api/upload', uploadLimiter, upload.single('file'), (req, res) => {
   const me = getUserId(req); if (!me) return res.status(401).json({ error: 'Please sign in.' });
-  if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
-  res.json({ url: '/uploads/' + req.file.filename, name: req.file.originalname });
+  const url = saveValidatedUpload(req, res, me);
+  if (!url) return;
+  res.json({ url, name: req.file.originalname || 'attachment' });
 });
 
 // ============================================================
@@ -1611,6 +1942,20 @@ app.get('/api/me/account', (req, res) => {
   const u = db.prepare('SELECT email, createdAt, lastSeen FROM users WHERE id = ?').get(me);
   if (!u) return res.status(401).json({ error: 'Please sign in.' });
   res.json({ email: u.email, joined: u.createdAt, lastSeen: u.lastSeen || null });
+});
+
+// ---- Error handler --------------------------------------------------------
+// Multer failures (oversized files, bad field names, rejected MIME types)
+// surface here as non-JSON errors; convert them to clean 400/413 JSON instead
+// of leaking Express's default HTML 500 page.
+app.use((err, req, res, next) => {
+  const isMulter = err && (err instanceof multer.MulterError || err.message === 'Unsupported file type. Only JPG, PNG, GIF, WebP, and AVIF images are allowed.');
+  if (isMulter) {
+    const status = err instanceof multer.MulterError && (err.code === 'LIMIT_FILE_SIZE' || err.code === 'LIMIT_UNEXPECTED_FILE') ? 413 : 400;
+    return res.status(status).json({ error: err.message || 'Upload rejected.' });
+  }
+  console.error(err);
+  res.status(500).json({ error: 'Something went wrong on the server.' });
 });
 
 app.listen(PORT, () => {

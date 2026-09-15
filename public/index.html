@@ -21,12 +21,12 @@
       } catch (e) {}
     })();
   </script>
-  <link rel="stylesheet" href="style.css?v=9" />
+  <link rel="stylesheet" href="style.css?v=12" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <link rel="stylesheet" href="vendor/leaflet/leaflet.css" />
+  <script src="vendor/leaflet/leaflet.js"></script>
 </head>
 <body>
   <header class="topbar">
@@ -79,11 +79,12 @@
         <p class="form-error hidden" id="auth-error"></p>
         <button type="submit" class="btn btn-primary btn-block" id="auth-submit">Log in</button>
       </form>
+      <div id="auth-social"></div>
       <p class="modal-switch">
         <span id="auth-switch-text">Don't have an account?</span>
         <a href="#" id="auth-switch">Sign up</a>
       </p>
-      <p class="demo-hint">Demo: alya@demo.com / rohan@demo.com / cafe@demo.com · pw: demo123</p>
+      <p class="demo-hint hidden" id="auth-demo-hint"></p>
     </div>
   </div>
 
@@ -109,6 +110,6 @@
     <span id="toast-text"></span>
   </div>
 
-  <script src="app.js?v=9"></script>
+  <script src="app.js?v=12"></script>
 </body>
 </html>
