@@ -4,6 +4,9 @@
   "description": "A Facebook-style social feed. Browse without an account; sign up to post, like and comment.",
   "main": "server.js",
   "type": "commonjs",
+  "engines": {
+    "node": ">=22.5.0"
+  },
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js"

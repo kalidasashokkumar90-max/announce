@@ -67,8 +67,13 @@ app.disable('x-powered-by');
 const ALLOWED_ORIGINS = new Set(['http://localhost:3000']);
 if (process.env.APP_ORIGIN) ALLOWED_ORIGINS.add(String(process.env.APP_ORIGIN).replace(/\/+$/, ''));
 // APP_URL is the canonical external origin (used for Google OAuth redirects);
-// its origin is also trusted for same-origin checks.
-const APP_URL = String(process.env.APP_URL || `http://localhost:${PORT}`).replace(/\/+$/, '');
+// its origin is also trusted for same-origin checks. On Railway the public
+// domain is injected as RAILWAY_PUBLIC_DOMAIN, so a fresh deploy works before
+// any APP_URL/APP_ORIGIN vars are hand-configured.
+const deployedDomain = process.env.RAILWAY_PUBLIC_DOMAIN
+  ? `https://${String(process.env.RAILWAY_PUBLIC_DOMAIN).replace(/^https?:\/\//i, '').replace(/\/+$/, '')}`
+  : '';
+const APP_URL = String(process.env.APP_URL || deployedDomain || `http://localhost:${PORT}`).replace(/\/+$/, '');
 try { ALLOWED_ORIGINS.add(new URL(APP_URL).origin); } catch {}
 // Uploaded files live in a separate directory so deployments with ephemeral
 // filesystems (e.g. Railway) can point UPLOAD_DIR at a persistent volume.
