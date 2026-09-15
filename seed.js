@@ -26,14 +26,45 @@ function seed() {
     '', now()).lastInsertRowid;
 
   const insertPost = db.prepare(
-    'INSERT INTO posts (authorId, body, image, type, createdAt) VALUES (?, ?, ?, ?, ?)'
+    'INSERT INTO posts (authorId, body, image, type, createdAt, hashtags) VALUES (?, ?, ?, ?, ?, ?)'
   );
 
-  insertPost.run(alya, 'First week at the cafe went great! Free coffee is a dangerous perk though. ☕😄', '', 'general', now());
-  insertPost.run(rohan, 'Shot the golden hour at Marine Drive today. The light was unreal. Who else loves sunset photography?', '', 'general', now());
-  insertPost.run(maker, 'Flat 20% off on all cold brews this weekend! Come say hi. 🧋', '', 'offer', now());
-  insertPost.run(alya, 'Tried a new ramen spot downtown. 10/10 would recommend the spicy tonkotsu. 🍜', '', 'general', now());
-  insertPost.run(rohan, 'Offer: portrait photo sessions at student prices this month. DM to book! 📸', '', 'offer', now());
+  const p1 = insertPost.run(alya, 'First week at the cafe went great! Free coffee is a dangerous perk though. ☕😄', '', 'general', now(), '#barista,#cafe').lastInsertRowid;
+  const p2 = insertPost.run(rohan, 'Shot the golden hour at Marine Drive today. The light was unreal. Who else loves sunset photography?', '', 'general', now(), '#photography,#sunset').lastInsertRowid;
+  const p3 = insertPost.run(maker, 'Flat 20% off on all cold brews this weekend! Come say hi. 🧋', '', 'offer', now(), '#coldbrew,#offer').lastInsertRowid;
+  const p4 = insertPost.run(alya, 'Tried a new ramen spot downtown. 10/10 would recommend the spicy tonkotsu. 🍜', '', 'general', now(), '#foodie,#ramen').lastInsertRowid;
+  const p5 = insertPost.run(rohan, 'Offer: portrait photo sessions at student prices this month. DM to book! 📸', '', 'offer', now(), '#photography,#offer').lastInsertRowid;
+
+  // Follows so the "following" feed has data out of the box.
+  const insertFollow = db.prepare(
+    'INSERT OR IGNORE INTO follows (followerId, followingId, createdAt) VALUES (?, ?, ?)'
+  );
+  insertFollow.run(alya, rohan, now());
+  insertFollow.run(alya, maker, now());
+  insertFollow.run(rohan, maker, now());
+
+  // A few reactions on the demo posts.
+  const insertReaction = db.prepare(
+    'INSERT OR IGNORE INTO post_reactions (postId, userId, emoji, createdAt) VALUES (?, ?, ?, ?)'
+  );
+  insertReaction.run(p1, rohan, '👍', now());
+  insertReaction.run(p1, maker, '❤️', now());
+  insertReaction.run(p2, alya, '🔥', now());
+  insertReaction.run(p4, rohan, '😄', now());
+  insertReaction.run(p3, alya, '👍', now());
+
+  // Events (startAt computed a few days out so they show as upcoming).
+  const later = (days) => new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
+  const insertEvent = db.prepare(
+    'INSERT INTO events (hostId, title, description, location, startAt, createdAt) VALUES (?, ?, ?, ?, ?, ?)'
+  );
+  const e1 = insertEvent.run(maker, 'Cold Brew Tasting Night', 'Free cold brew tastings and a latte art demo. Come say hi!', 'Bandra, Mumbai', later(3), now()).lastInsertRowid;
+  const e2 = insertEvent.run(rohan, 'Golden Hour Photo Walk', 'Guided photo walk along Marine Drive at sunset. Beginners welcome.', 'Marine Drive, Mumbai', later(6), now()).lastInsertRowid;
+  const insertParticipant = db.prepare(
+    'INSERT OR IGNORE INTO event_participants (eventId, userId, createdAt) VALUES (?, ?, ?)'
+  );
+  insertParticipant.run(e1, alya, now());
+  insertParticipant.run(e2, alya, now());
 
   const insertJob = db.prepare(
     'INSERT INTO jobs (giverId, title, description, category, wage, lat, lng, locationText, filled, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)'

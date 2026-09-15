@@ -2,4 +2,7 @@ node_modules/
 data/
 server_run.log
 server_run.log.err
+server_run.err
 public/uploads/
+*.log
+prove.bat

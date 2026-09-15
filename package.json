@@ -1,5 +1,5 @@
 {
-  "name": "socialfeed",
+  "name": "announce",
   "version": "1.0.0",
   "description": "A Facebook-style social feed. Browse without an account; sign up to post, like and comment.",
   "main": "server.js",
@@ -9,8 +9,10 @@
     "dev": "node --watch server.js"
   },
   "dependencies": {
+    "bcryptjs": "^2.4.3",
     "express": "^4.19.2",
-    "multer": "^2.0.2",
-    "bcryptjs": "^2.4.3"
+    "express-rate-limit": "^8.7.0",
+    "helmet": "^8.3.0",
+    "multer": "^2.0.2"
   }
 }

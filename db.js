@@ -2,7 +2,10 @@ const path = require('path');
 const { DatabaseSync } = require('node:sqlite');
 
 const DATA_DIR = path.join(__dirname, 'data');
-const DB_PATH = path.join(DATA_DIR, 'socialfeed.db');
+// DB_PATH can be overridden (e.g. a DB_PATH-scoped smoke test) so the real
+// data/announce.db is never touched by test runs. The guarded migrations
+// below are applied to whichever file is opened.
+const DB_PATH = process.env.DB_PATH || path.join(DATA_DIR, 'announce.db');
 
 const db = new DatabaseSync(DB_PATH);
 
@@ -18,6 +21,10 @@ db.exec(`
     bio        TEXT DEFAULT '',
     photo      TEXT DEFAULT '',
     skills     TEXT DEFAULT '',
+    location   TEXT NOT NULL DEFAULT '',
+    theme      TEXT NOT NULL DEFAULT '',
+    notifyPrefs TEXT NOT NULL DEFAULT '{}',
+    privateProfile INTEGER NOT NULL DEFAULT 0,
     online     INTEGER NOT NULL DEFAULT 0,
     lastSeen   TEXT DEFAULT '',
     createdAt  TEXT NOT NULL
@@ -29,6 +36,8 @@ db.exec(`
     body       TEXT NOT NULL,
     image      TEXT DEFAULT '',
     type       TEXT NOT NULL DEFAULT 'general',
+    shareOfId  INTEGER REFERENCES posts(id) ON DELETE CASCADE,
+    hashtags   TEXT DEFAULT '',
     createdAt  TEXT NOT NULL
   );
 
@@ -45,6 +54,7 @@ db.exec(`
     postId     INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
     authorId   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     body       TEXT NOT NULL,
+    parentId   INTEGER REFERENCES comments(id) ON DELETE CASCADE,
     createdAt  TEXT NOT NULL
   );
 
@@ -125,18 +135,84 @@ db.exec(`
     createdAt TEXT NOT NULL,
     UNIQUE(blockerId, blockedId)
   );
+
+  CREATE TABLE IF NOT EXISTS follows (
+    followerId  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    followingId INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    createdAt   TEXT NOT NULL,
+    PRIMARY KEY (followerId, followingId)
+  );
+
+  CREATE TABLE IF NOT EXISTS post_reactions (
+    postId    INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    userId    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    emoji     TEXT NOT NULL,
+    createdAt TEXT NOT NULL,
+    PRIMARY KEY (postId, userId, emoji)
+  );
+
+  CREATE TABLE IF NOT EXISTS saved_posts (
+    postId    INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    userId    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    createdAt TEXT NOT NULL,
+    PRIMARY KEY (postId, userId)
+  );
+
+  CREATE TABLE IF NOT EXISTS events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    hostId      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title       TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    location    TEXT DEFAULT '',
+    startAt     TEXT NOT NULL,
+    createdAt   TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS event_participants (
+    eventId   INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+    userId    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    createdAt TEXT NOT NULL,
+    PRIMARY KEY (eventId, userId)
+  );
 `);
 
-try { db.exec('ALTER TABLE messages ADD COLUMN replyToId INTEGER REFERENCES messages(id) ON DELETE SET NULL'); } catch (_) {}
-try { db.exec('ALTER TABLE messages ADD COLUMN edited INTEGER NOT NULL DEFAULT 0'); } catch (_) {}
-try { db.exec('ALTER TABLE messages ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0'); } catch (_) {}
-try { db.exec('ALTER TABLE messages ADD COLUMN attachment TEXT DEFAULT \'\''); } catch (_) {}
-try { db.exec('ALTER TABLE messages ADD COLUMN forwardedId INTEGER REFERENCES messages(id) ON DELETE SET NULL'); } catch (_) {}
-try { db.exec('ALTER TABLE messages ADD COLUMN starred INTEGER NOT NULL DEFAULT 0'); } catch (_) {}
-try { db.exec('ALTER TABLE messages ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0'); } catch (_) {}
-try { db.exec('ALTER TABLE messages ADD COLUMN readAt TEXT DEFAULT \'\''); } catch (_) {}
-try { db.exec('ALTER TABLE conversations ADD COLUMN muted INTEGER NOT NULL DEFAULT 0'); } catch (_) {}
-try { db.exec('ALTER TABLE users ADD COLUMN online INTEGER NOT NULL DEFAULT 0'); } catch (_) {}
-try { db.exec('ALTER TABLE users ADD COLUMN lastSeen TEXT DEFAULT \'\''); } catch (_) {}
+// ---- Guarded migrations ----------------------------------------------------
+// Every ALTER TABLE is guarded by a PRAGMA table_info check so it only runs on
+// databases whose CREATE TABLE predates the column. Blindly ALTERing a fresh
+// DB (where CREATE TABLE IF NOT EXISTS already includes the column) throws
+// "duplicate column name"; the PRAGMA check avoids that and makes each
+// migration explicit instead of relying on swallowed try/catch errors.
+function tableColumnNames(table) {
+  return db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
+}
+
+function ensureColumn(table, column, ddl) {
+  if (tableColumnNames(table).includes(column)) return;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+}
+
+// users — Settings feature columns (fresh DBs get them from CREATE TABLE).
+ensureColumn('users', 'online', `online INTEGER NOT NULL DEFAULT 0`);
+ensureColumn('users', 'lastSeen', `lastSeen TEXT DEFAULT ''`);
+ensureColumn('users', 'location', `location TEXT NOT NULL DEFAULT ''`);
+ensureColumn('users', 'theme', `theme TEXT NOT NULL DEFAULT ''`);
+ensureColumn('users', 'notifyPrefs', `notifyPrefs TEXT NOT NULL DEFAULT '{}'`);
+ensureColumn('users', 'privateProfile', `privateProfile INTEGER NOT NULL DEFAULT 0`);
+
+// messages + conversations — columns added after the original tables shipped.
+ensureColumn('messages', 'replyToId', `replyToId INTEGER REFERENCES messages(id) ON DELETE SET NULL`);
+ensureColumn('messages', 'edited', `edited INTEGER NOT NULL DEFAULT 0`);
+ensureColumn('messages', 'deleted', `deleted INTEGER NOT NULL DEFAULT 0`);
+ensureColumn('messages', 'attachment', `attachment TEXT DEFAULT ''`);
+ensureColumn('messages', 'forwardedId', `forwardedId INTEGER REFERENCES messages(id) ON DELETE SET NULL`);
+ensureColumn('messages', 'starred', `starred INTEGER NOT NULL DEFAULT 0`);
+ensureColumn('messages', 'pinned', `pinned INTEGER NOT NULL DEFAULT 0`);
+ensureColumn('messages', 'readAt', `readAt TEXT DEFAULT ''`);
+ensureColumn('conversations', 'muted', `muted INTEGER NOT NULL DEFAULT 0`);
+
+// posts + comments — social feed columns added after the original tables shipped.
+ensureColumn('posts', 'shareOfId', `shareOfId INTEGER REFERENCES posts(id) ON DELETE CASCADE`);
+ensureColumn('posts', 'hashtags', `hashtags TEXT DEFAULT ''`);
+ensureColumn('comments', 'parentId', `parentId INTEGER REFERENCES comments(id) ON DELETE CASCADE`);
 
 module.exports = db;

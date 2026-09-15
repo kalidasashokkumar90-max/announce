@@ -15,6 +15,28 @@ const state = {
 // ---------- Helpers ----------
 const $ = (sel) => document.querySelector(sel);
 const app = $('#app');
+
+// Brand logo fallback: the header shows a plain "ANNOUNCE" wordmark until one
+// of the logo files actually exists. CSP refuses inline handlers, so the
+// load/error wiring lives here. A successfully loaded logo hides the wordmark.
+(function () {
+  const brand = $('.brand');
+  if (!brand) return;
+  const imgs = Array.from(brand.querySelectorAll('.logo'));
+  const markLoaded = () => brand.classList.add('has-logo');
+  const loaded = new WeakSet();
+  const onLoad = (img) => {
+    if (img.complete && img.naturalWidth > 0 && !loaded.has(img)) {
+      loaded.add(img);
+      markLoaded();
+    }
+  };
+  imgs.forEach((img) => {
+    img.addEventListener('load', () => onLoad(img), { once: true });
+    img.addEventListener('error', () => { img.style.display = 'none'; }, { once: true });
+    onLoad(img);
+  });
+})();
 const TYPE_META = {
   general: { label: 'General', emoji: '📝' },
   offer: { label: 'Offer', emoji: '🏷️' },
@@ -25,6 +47,9 @@ const ICONS = {
   heart: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1-1.1a5.5 5.5 0 0 0-7.8 7.8l1 1L12 21.2l7.8-7.8 1-1a5.5 5.5 0 0 0 0-7.8z"></path></svg>',
   heartFilled: '<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1-1.1a5.5 5.5 0 0 0-7.8 7.8l1 1L12 21.2l7.8-7.8 1-1a5.5 5.5 0 0 0 0-7.8z"></path></svg>',
   comment: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.7z"></path></svg>',
+  bookmark: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path></svg>',
+  bookmarkFilled: '<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path></svg>',
+  share: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"></circle><circle cx="6" cy="12" r="3"></circle><circle cx="18" cy="19" r="3"></circle><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"></line><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"></line></svg>',
 };
 
 async function api(url, options = {}) {
@@ -89,7 +114,7 @@ function initials(name) {
 
 function avatar(user, size = 40) {
   const inner = user.photo
-    ? `<img src="${user.photo}" alt="" />`
+    ? `<img src="${escapeHtml(user.photo)}" alt="" />`
     : initials(user.name);
   return `<span class="ring" style="width:${size}px;height:${size}px;flex:0 0 ${size}px"><span class="avatar-circle" style="font-size:${Math.round(size * 0.38)}px;background:${gradFor(user.name)}">${inner}</span></span>`;
 }
@@ -111,11 +136,441 @@ function escapeHtml(str) {
   }[c]));
 }
 
+// ---------- Social features: shared helpers ----------
+const REACTION_EMOJIS = ['👍', '❤️', '🔥', '😂', '😮', '😢'];
+const REACT_ZERO = '👍';
+const NOTIF_ICONS = { like: '❤️', comment: '💬', share: '🔁', follow: '🤝', apply: '📄', application_accept: '✅', event: '📅' };
+const reactCache = new Map();
+const followCache = new Map();
+let feedTab = 'for-you';
+
+function renderBodyWithTags(body) {
+  const esc = escapeHtml(body);
+  return esc.replace(/(^|\s)#([a-zA-Z0-9_]+)/g, (m, pre, tag) => `${pre}<a href="#" class="tag-link" data-action="tag" data-tag="#${tag}">#${tag}</a>`);
+}
+
+function sharedFromHtml(sp) {
+  if (!sp || !sp.id) return '';
+  const src = sp.sharedFrom || sp;
+  const who = src.author || {};
+  const meta = src.sharer && src.sharer.name ? `${escapeHtml(src.sharer.name)} reposted` : 'Reposted';
+  const inner = `
+    <div class="card-head" style="padding:10px 12px;border-bottom:none">
+      ${avatar(who, 30)}
+      <div class="head-meta">
+        <div class="who"><a href="#" class="post-author" data-user="${who.id}">${escapeHtml(who.name || 'Unknown')}</a></div>
+        <div class="meta-line">${timeAgo(src.createdAt)}</div>
+      </div>
+    </div>
+    ${src.body ? `<div class="post-caption" style="padding:0 12px 8px">${renderBodyWithTags(src.body)}</div>` : ''}
+    ${src.image ? `<img src="${escapeHtml(src.image)}" class="post-img" data-lightbox="${escapeHtml(src.image)}" alt="" />` : ''}`;
+  return `<div class="shared-head" style="font-size:12px;color:var(--text-soft);padding:10px 14px 4px;font-weight:600">🔁 ${meta}</div>
+    <div class="shared-from" style="border:1px solid var(--border);border-radius:var(--radius-md);margin:4px 14px;overflow:hidden;background:var(--surface-2)">${inner}</div>`;
+}
+
+function postReactions(p) {
+  const list = (p.reactions && Array.isArray(p.reactions)) ? p.reactions : [];
+  if (list.length) {
+    return list.map((r) => ({
+      emoji: r.emoji || REACT_ZERO,
+      count: Number(r.count) || 0,
+      active: !!r.active,
+    }));
+  }
+  // Fallback: derive the initial like state from the legacy fields so the
+  // like button/count are never blank on first paint.
+  if ((p.likeCount || p.likedByMe != null)) {
+    return [{ emoji: REACT_ZERO, count: Number(p.likeCount) || 0, active: !!p.likedByMe }];
+  }
+  return [];
+}
+
+function reactionFor(postId, emoji) {
+  const list = reactCache.get(String(postId)) || [];
+  return list.find((r) => r.emoji === emoji) || { emoji, count: 0, active: false };
+}
+
+function reactionsBarHtml(postId) {
+  const list = reactCache.get(String(postId)) || [];
+  if (!list.length) return '';
+  const chips = list.map((r) => `
+    <button type="button" class="react-chip" data-action="react-chip" data-post-id="${postId}" data-emoji="${escapeHtml(r.emoji)}" aria-pressed="${r.active ? 'true' : 'false'}">
+      <span class="emoji">${escapeHtml(r.emoji)}</span><span class="react-count">${r.count}</span>
+    </button>`).join('');
+  return `<div class="react-bar" id="react-bar-${postId}">${chips}</div>`;
+}
+
+function reactionPickerHtml(postId) {
+  return `<div class="react-picker" id="react-picker-${postId}" role="menu" aria-label="Reactions">${REACTION_EMOJIS.map((e) => {
+    const cur = reactionFor(postId, e);
+    return `<button type="button" data-action="react" data-post-id="${postId}" data-emoji="${e}" role="menuitem" aria-pressed="${cur.active ? 'true' : 'false'}">${e}</button>`;
+  }).join('')}</div>`;
+}
+
+async function quickReact(postId, emoji) {
+  if (!state.me) return requireLogin({ type: 'react', postId, emoji }, 'Create an account to react to this post.');
+  const cur = reactionFor(postId, emoji);
+  await doReact(postId, emoji, !cur.active);
+}
+
+async function doReact(postId, emoji, active) {
+  const data = await api(`/api/posts/${postId}/react`, { method: 'POST', body: JSON.stringify({ emoji, active }) });
+  reactCache.set(String(postId), data.reactions || []);
+  updatePostReactionsUI(postId);
+}
+
+function updatePostReactionsUI(postId) {
+  const bar = $('#react-bar-' + postId);
+  if (bar) {
+    const next = reactionsBarHtml(postId);
+    if (next) bar.outerHTML = next;
+    else bar.remove();
+  }
+  const likeInfo = reactionFor(postId, REACT_ZERO);
+  const btn = $('#like-' + postId);
+  if (btn) {
+    const active = !!likeInfo.active;
+    btn.innerHTML = `<span class="btn-ico">${active ? ICONS.heartFilled : ICONS.heart}</span><span id="like-count-${postId}">${Number(likeInfo.count) || 0}</span>`;
+    btn.classList.toggle('active', active);
+    btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+    btn.setAttribute('aria-label', (active ? 'Unlike' : 'Like') + ' this post');
+    btn.classList.remove('pop-pop'); void btn.offsetWidth; btn.classList.add('pop-pop');
+  }
+  const picker = $('#react-picker-' + postId);
+  if (picker) {
+    picker.querySelectorAll('[data-emoji]').forEach((b) => {
+      const cur = reactionFor(postId, b.dataset.emoji);
+      b.setAttribute('aria-pressed', cur.active ? 'true' : 'false');
+    });
+  }
+}
+
+function feedPillsHtml() {
+  return `
+    <div class="feed-pills" role="tablist" aria-label="Feed filter">
+      <button class="pill ${feedTab !== 'following' ? 'active' : ''}" data-action="feed-tab" data-feed="for-you" role="tab" aria-selected="${feedTab === 'for-you'}">For you</button>
+      <button class="pill ${feedTab === 'following' ? 'active' : ''}" data-action="feed-tab" data-feed="following" role="tab" aria-selected="${feedTab === 'following'}">Following</button>
+    </div>`;
+}
+
+function tagBannerHtml(tag) {
+  if (!tag) return '';
+  return `
+    <div class="feed-filter-row">
+      <span class="feed-filter-chip">
+        ${escapeHtml(tag)}
+        <button type="button" class="chip-remove" data-action="tag-clear" aria-label="Clear hashtag filter" title="Clear filter">×</button>
+      </span>
+    </div>`;
+}
+
+async function loadTag(tag) {
+  state.currentView = 'tag';
+  state.pendingTag = tag;
+  document.title = tag + ' · ANNOUNCE';
+  setActiveNav(null);
+  app.innerHTML = `<div style="max-width:760px;margin:0 auto;padding:24px 16px 40px">
+    ${tagBannerHtml(tag)}
+    <div id="tag-posts" class="feed-stagger"><div class="spinner">Loading...</div></div>
+  </div>`;
+  const data = await api('/api/tags/' + encodeURIComponent(String(tag || '').replace(/^#/, '')));
+  renderTagFeed(data.posts || []);
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+function renderTagFeed(posts) {
+  const box = $('#tag-posts');
+  if (!box) return;
+  if (!posts.length) {
+    box.innerHTML = '<div class="empty" style="padding:48px;text-align:center;color:var(--text-soft)">No posts with this tag yet.</div>';
+    return;
+  }
+  box.innerHTML = posts.map((p) => postHtml(p)).join('');
+  bindFeed();
+}
+
+function toggleShareMenu(postId) {
+  const menu = $('#share-menu-' + postId);
+  if (!menu) return;
+  const wasOpen = menu.classList.contains('open');
+  document.querySelectorAll('.share-menu.open').forEach((m) => m.classList.remove('open'));
+  if (!wasOpen) menu.classList.add('open');
+}
+
+async function doShareToFeed(postId) {
+  if (!state.me) return requireLogin({ type: 'share', postId }, 'Create an account to share this post.');
+  const data = await api(`/api/posts/${postId}/share`, { method: 'POST' });
+  document.querySelectorAll('.share-menu.open').forEach((m) => m.classList.remove('open'));
+  const btn = $('#share-btn-' + postId);
+  if (btn) {
+    const cnt = btn.querySelector('.thumb-count');
+    if (cnt) cnt.textContent = Number(data.sharesCount) || (parseInt(cnt.textContent, 10) || 0) + 1;
+  }
+  toast('Shared to your feed');
+  if (state.currentView === 'feed' || state.currentView === 'tag') loadFeed();
+}
+
+async function doShareCopy(postId) {
+  try {
+    await navigator.clipboard.writeText(location.origin + '/posts/' + postId);
+  } catch (err) {
+    return showGotcha('Could not copy the link.');
+  }
+  document.querySelectorAll('.share-menu.open').forEach((m) => m.classList.remove('open'));
+  toast('Link copied to clipboard');
+}
+
+async function toggleSavePost(postId) {
+  if (!state.me) return requireLogin({ type: 'save', postId }, 'Create an account to save this post.');
+  const btn = document.querySelector('[data-action="save"][data-post-id="' + postId + '"]');
+  const saved = btn ? btn.getAttribute('aria-pressed') === 'true' : false;
+  if (saved) {
+    await api(`/api/posts/${postId}/save`, { method: 'DELETE' });
+  } else {
+    await api(`/api/posts/${postId}/save`, { method: 'POST' });
+  }
+  const all = document.querySelectorAll('[data-action="save"][data-post-id="' + postId + '"]');
+  all.forEach((b) => {
+    b.classList.toggle('saved', !saved);
+    b.setAttribute('aria-pressed', saved ? 'false' : 'true');
+    b.setAttribute('aria-label', (saved ? 'Save' : 'Unsave') + ' this post');
+    const ico = b.firstElementChild;
+    if (ico) ico.innerHTML = !saved ? ICONS.bookmarkFilled : ICONS.bookmark;
+  });
+  if (state.currentView === 'saved') goSaved();
+}
+
+function seedFollowCache(u) {
+  if (u && u.id != null) followCache.set(String(u.id), !!(u.isFollowing != null ? u.isFollowing : u.followedByMe));
+}
+
+function followBtnHtml(userId, following, name) {
+  const on = !!following;
+  return `<button type="button" class="follow-btn ${on ? 'following' : ''}" data-action="follow" data-user-id="${userId}" data-follow-name="${escapeHtml(name || '')}" aria-pressed="${on ? 'true' : 'false'}">${on ? 'Following ✓' : 'Follow'}</button>`;
+}
+
+function getFollowState(userId, btn) {
+  if (followCache.has(String(userId))) return followCache.get(String(userId));
+  return btn ? btn.getAttribute('aria-pressed') === 'true' : false;
+}
+
+function updateFollowBtn(btn, following) {
+  if (!btn) return;
+  btn.classList.toggle('following', following);
+  btn.setAttribute('aria-pressed', following ? 'true' : 'false');
+  btn.textContent = following ? 'Following ✓' : 'Follow';
+}
+
+async function toggleFollow(userId, btn) {
+  const wasFollowing = getFollowState(userId, btn);
+  if (wasFollowing) {
+    await api(`/api/users/${userId}/follow`, { method: 'DELETE' });
+  } else {
+    await api(`/api/users/${userId}/follow`, { method: 'POST' });
+  }
+  followCache.set(String(userId), !wasFollowing);
+  updateFollowBtn(btn, !wasFollowing);
+  if (state.currentView === 'profile' && state.profileUserId === userId) goProfile(userId);
+}
+
+function suggestionsHtml(users) {
+  if (!state.me) return '';
+  const items = (users || []).filter((u) => u && u.id != null);
+  if (!items.length) return '';
+  items.forEach((u) => followCache.set(String(u.id), !!u.followedByMe));
+  return `
+    <div class="card" style="padding:16px">
+      <h4 style="margin:0 0 12px;font-size:15px">People you may know</h4>
+      <div class="suggestions">
+        ${items.map((u) => `
+          <div class="suggest-card">
+            <a href="#" data-user="${u.id}" style="text-decoration:none">${avatar(u, 28)}</a>
+            <div class="suggest-info">
+              <a href="#" class="suggest-name" data-user="${u.id}">${escapeHtml(u.name)}</a>
+              <div class="suggest-meta">${escapeHtml(u.role || 'Member')}</div>
+            </div>
+            ${followBtnHtml(u.id, !!u.followedByMe, u.name)}
+          </div>`).join('')}
+      </div>
+    </div>`;
+}
+
+function savedTitle(p) {
+  const tags = String(p.hashtags || '').split(/\s+/).filter(Boolean);
+  if (tags.length) return tags.slice(0, 3).join(' ');
+  const words = String(p.body || '').trim().split(/\s+/).filter(Boolean);
+  const head = words.slice(0, 8).join(' ');
+  return (head ? head + (words.length > 8 ? '…' : '') : '') || 'Saved post';
+}
+
+function savedCardHtml(p) {
+  const author = p.author || {};
+  return `
+    <div class="saved-card" data-post="${p.id}">
+      ${p.image ? `<img src="${escapeHtml(p.image)}" class="saved-thumb" data-lightbox="${escapeHtml(p.image)}" alt="" />` : ''}
+      <div class="saved-body">
+        <a href="#" class="saved-title" data-user="${author.id}">${escapeHtml(savedTitle(p))}</a>
+        <p class="saved-snippet">${escapeHtml(p.body || '')}</p>
+        <div class="saved-meta">${avatar(author, 20)}<span>${escapeHtml(author.name || 'Unknown')}</span> · ${timeAgo(p.createdAt)}</div>
+        <div class="saved-actions">
+          <button type="button" class="bookmark-btn saved" data-action="save" data-post-id="${p.id}" aria-pressed="true" aria-label="Unsave this post" title="Unsave"><span class="btn-ico">${ICONS.bookmarkFilled}</span></button>
+        </div>
+      </div>
+    </div>`;
+}
+
+async function goSaved() {
+  if (!state.me) return showGotcha('Sign in to view your saved posts.');
+  state.currentView = 'saved';
+  document.title = 'Saved · ANNOUNCE';
+  document.body.classList.remove('narrow');
+  setActiveNav('saved');
+  viewEnter();
+  app.innerHTML = `
+    <div style="max-width:760px;margin:0 auto;padding:24px 16px 40px">
+      <h2 style="margin:0 0 14px">Saved posts</h2>
+      <div class="saved-grid" id="saved-grid"><div class="spinner" style="padding:32px">Loading...</div></div>
+    </div>`;
+  const data = await api('/api/my/saved');
+  const box = $('#saved-grid');
+  if (!box) return;
+  const posts = data.posts || [];
+  if (!posts.length) {
+    box.innerHTML = '<div class="empty" style="padding:48px;text-align:center;color:var(--text-soft)">Nothing saved yet — tap the bookmark on any post.</div>';
+    return;
+  }
+  box.innerHTML = posts.map((p) => savedCardHtml(p)).join('');
+  bindFeed();
+  staggerCards();
+}
+
+function eventCardHtml(ev) {
+  const host = ev.host || {};
+  const isHost = state.me && host.id != null && state.me.id === host.id;
+  const dt = ev.startAt ? new Date(ev.startAt) : null;
+  const valid = dt && !isNaN(dt.getTime());
+  const today = valid && new Date().toDateString() === dt.toDateString();
+  const day = valid ? dt.getDate() : '?';
+  const month = valid ? dt.toLocaleDateString('en-US', { month: 'short' }) : '';
+  const time = valid ? dt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+  return `
+    <div class="card event-card" data-event="${ev.id}">
+      <div class="event-date ${today ? 'today' : ''}">
+        <span class="day">${day}</span>
+        <span class="month">${month}</span>
+      </div>
+      <div class="event-info">
+        <h3 class="event-title">${escapeHtml(ev.title)}</h3>
+        ${ev.description ? `<p class="job-desc">${escapeHtml(ev.description)}</p>` : ''}
+        <div class="event-meta">
+          ${ev.location ? `<span>📍 ${escapeHtml(ev.location)}</span>` : ''}
+          ${time ? `<span>🕒 ${time}</span>` : ''}
+          <span>👥 <span class="attendee-count" data-attendees="${ev.id}">${Number(ev.attendeeCount) || 0}</span> attending</span>
+        </div>
+        <div class="event-action">
+          <span style="font-size:12px;color:var(--text-soft)">Hosted by <a href="#" class="post-author" data-user="${host.id}">${escapeHtml(host.name || 'Unknown')}</a></span>
+          ${isHost ? `<button type="button" class="btn btn-ghost" data-action="event-delete" data-event-id="${ev.id}" style="color:var(--danger);padding:6px 10px">Delete</button>` : ''}
+          ${state.me ? `<button type="button" class="rsvp-btn ${ev.attending ? 'going' : ''}" data-action="event-rsvp" data-event-id="${ev.id}" aria-pressed="${ev.attending ? 'true' : 'false'}">${ev.attending ? 'Going ✓' : 'RSVP'}</button>` : ''}
+        </div>
+      </div>
+    </div>`;
+}
+
+function renderEvents(events) {
+  const grid = $('#events-grid');
+  if (!grid) return;
+  if (!events || !events.length) {
+    grid.innerHTML = '<div class="empty" style="padding:48px;text-align:center;color:var(--text-soft)">No events yet — create the first one!</div>';
+    return;
+  }
+  grid.innerHTML = events.map((e) => eventCardHtml(e)).join('');
+  grid.querySelectorAll('[data-user]').forEach((el) => {
+    el.addEventListener('click', (ea) => { ea.preventDefault(); goProfile(Number(el.dataset.user)); });
+  });
+}
+
+async function goEvents() {
+  state.currentView = 'events';
+  document.title = 'Events · ANNOUNCE';
+  document.body.classList.remove('narrow');
+  setActiveNav('events');
+  viewEnter();
+  app.innerHTML = `
+    <div style="max-width:760px;margin:0 auto;padding:24px 16px 40px">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;gap:12px;flex-wrap:wrap">
+        <h2 style="margin:0">Events</h2>
+        ${state.me ? `<button class="btn btn-primary" data-action="event-create-open">+ Create event</button>` : ''}
+      </div>
+      <div class="events-grid" id="events-grid"><div class="spinner" style="padding:32px">Loading...</div></div>
+    </div>`;
+  const data = await api('/api/events');
+  renderEvents(data.events || []);
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+function showCreateEvent() {
+  openSheet(`
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+      <h2 style="margin:0">Create event</h2>
+      <button type="button" class="btn btn-soft btn-sm" data-action="event-create-close" aria-label="Close">✕</button>
+    </div>
+    <form id="event-create-form">
+      <label>Title</label>
+      <input type="text" id="event-title" maxlength="80" required placeholder="e.g. Community cleanup" />
+      <label>Description</label>
+      <textarea id="event-desc" maxlength="240" placeholder="What's this about?"></textarea>
+      <label>Location</label>
+      <input type="text" id="event-location" maxlength="80" placeholder="e.g. Central Park" />
+      <label>When</label>
+      <input type="datetime-local" id="event-when" required />
+      <div class="modal-actions" style="margin-top:14px">
+        <button type="button" class="btn btn-ghost" data-action="event-create-close">Cancel</button>
+        <button type="submit" class="btn btn-primary">Create event</button>
+      </div>
+    </form>`);
+  setTimeout(() => {
+    const form = $('#event-create-form');
+    if (form) form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const title = $('#event-title').value.trim();
+      const whenVal = $('#event-when').value;
+      if (!title) return showGotcha('Please give the event a title.');
+      const startAt = whenVal ? new Date(whenVal).toISOString() : new Date().toISOString();
+      try {
+        await api('/api/events', { method: 'POST', body: JSON.stringify({ title, description: $('#event-desc').value.trim(), location: $('#event-location').value.trim(), startAt }) });
+      } catch (err) { return showGotcha(err.message); }
+      closeSheet();
+      toast('Event created');
+      goEvents();
+    });
+  }, 0);
+}
+
+async function rsvpEvent(eventId) {
+  if (!state.me) return requireLogin({ type: 'event', eventId }, 'Create an account to RSVP to events.');
+  const btn = document.querySelector('[data-action="event-rsvp"][data-event-id="' + eventId + '"]');
+  const going = btn ? btn.getAttribute('aria-pressed') === 'true' : false;
+  const data = await api(`/api/events/${eventId}/rsvp`, { method: 'POST', body: JSON.stringify({ going: !going }) });
+  document.querySelectorAll('[data-action="event-rsvp"][data-event-id="' + eventId + '"]').forEach((b) => {
+    b.classList.toggle('going', !going);
+    b.setAttribute('aria-pressed', going ? 'false' : 'true');
+    b.textContent = !going ? 'Going ✓' : 'RSVP';
+  });
+  const cnt = document.querySelector('[data-attendees="' + eventId + '"]');
+  if (cnt) cnt.textContent = Math.max(0, Number(data.attendeeCount) || (parseInt(cnt.textContent, 10) || 0) + (!going ? 1 : -1));
+}
+
+async function deleteEvent(eventId) {
+  await api('/api/events/' + eventId, { method: 'DELETE' });
+  toast('Event deleted');
+  goEvents();
+}
+
 function showLightbox(src) {
   const ov = document.createElement('div');
   ov.className = 'overlay';
   ov.style.cssText = 'z-index:400;background:rgba(0,0,0,0.9)';
-  ov.innerHTML = `<img src="${src}" style="max-width:92vw;max-height:92vh;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,0.6)" />`;
+  ov.innerHTML = `<img src="${escapeHtml(src)}" style="max-width:92vw;max-height:92vh;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,0.6)" />`;
   ov.addEventListener('click', () => ov.remove());
   document.body.appendChild(ov);
 }
@@ -142,12 +597,23 @@ function renderAuth() {
           ${avatar(state.me, 34)} <span class="name-sm">${escapeHtml(state.me.name.split(' ')[0])}</span>
         </a>
         <div class="me-panel" id="me-panel">
-          <a href="#" id="me-profile-link"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg> My profile</a>
+          <div style="display:flex;align-items:center;gap:10px;padding:8px 10px 10px;border-bottom:1px solid var(--border);margin-bottom:4px">
+            ${avatar(state.me, 34)}
+            <div style="min-width:0">
+              <div style="font-size:13.5px;font-weight:700;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml(state.me.name)}</div>
+              <div style="font-size:11.5px;color:var(--text-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">@${escapeHtml(accountHandle(state.me))}</div>
+            </div>
+          </div>
+          <a href="#" id="me-profile-link"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg> View my profile</a>
           <a href="#" id="me-jobs-link"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="14" rx="2" ry="2"></rect><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"></path></svg> My posted jobs</a>
+          <a href="#" id="me-settings-link" data-action="open-settings"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg> Settings</a>
+          <button type="button" data-action="download-data"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg> Download my data</button>
           <button class="logout" id="logout-btn">Log out</button>
         </div>
       </div>
     `;
+    const settingsBtn = $('#nav-settings-btn');
+    if (settingsBtn) settingsBtn.classList.remove('hidden');
     $('#nav-profile').addEventListener('click', (e) => { e.preventDefault(); toggleMePanel(); });
     $('#me-profile-link').addEventListener('click', (e) => { e.preventDefault(); closePanels(); goProfile(state.me.id); });
     $('#me-jobs-link').addEventListener('click', (e) => { e.preventDefault(); closePanels(); goJobs('my-jobs'); });
@@ -168,6 +634,8 @@ function renderAuth() {
       <button class="btn btn-ghost" id="login-btn">Log in</button>
       <button class="btn btn-primary" id="signup-btn">Sign up</button>
     `;
+    const settingsBtn = $('#nav-settings-btn');
+    if (settingsBtn) settingsBtn.classList.add('hidden');
     $('#login-btn').addEventListener('click', () => openAuth('login'));
     $('#signup-btn').addEventListener('click', () => openAuth('signup'));
   }
@@ -212,7 +680,7 @@ async function renderNotifPanel() {
       el.dataset.notifLink = n.link || '';
       el.innerHTML = `
         <div class="notif-dot" style="${n.read ? 'background:var(--surface-3)' : ''}"></div>
-        <div class="notif-text">${avatar(n.actor, 30)}<div style="margin-top:4px">${escapeHtml(n.text)}</div><div class="notif-time">${timeAgo(n.createdAt)}</div></div>
+        <div class="notif-text">${avatar(n.actor, 30)}<div style="margin-top:4px">${(NOTIF_ICONS[n.type] ? NOTIF_ICONS[n.type] + ' ' : '')}${escapeHtml(n.text)}</div><div class="notif-time">${timeAgo(n.createdAt)}</div></div>
       `;
       el.addEventListener('click', () => {
         closePanels();
@@ -283,6 +751,8 @@ $('#auth-form').addEventListener('submit', async (e) => {
 
     const data = await api('/api/' + authMode, { method: 'POST', body: JSON.stringify(body) });
     state.me = data.user;
+    // Each user has their own theme preference (server is the source of truth).
+    if (state.me && typeof state.me.theme === 'string') applyTheme(state.me.theme);
     closeAuth();
     renderAuth();
     if (state.pendingAction) {
@@ -332,10 +802,15 @@ sheetOverlay.addEventListener('click', (e) => { if (e.target === sheetOverlay) c
 
 // ---------- Actions ----------
 async function runAction(action) {
-  if (action.type === 'like') await doLike(action.postId);
+  if (action.type === 'react') await doReact(action.postId, action.emoji, true);
   if (action.type === 'comment') await doComment(action.postId, action.text);
   if (action.type === 'post') await doCreatePost(action.text, action.image);
   if (action.type === 'apply') await doApply(action.jobId);
+  if (action.type === 'share') await doShareToFeed(action.postId);
+  if (action.type === 'save') await toggleSavePost(action.postId);
+  if (action.type === 'reply') await sendReply(action.commentId, action.postId);
+  if (action.type === 'event') await rsvpEvent(action.eventId);
+  if (action.type === 'follow') await toggleFollow(action.userId, null);
 }
 
 async function requireLogin(action, guestText) {
@@ -352,17 +827,20 @@ async function loadFeed() {
   document.body.classList.remove('narrow');
   app.innerHTML = '<div class="spinner">Loading feed...</div>';
   try {
-    const [postsData, jobsData] = await Promise.all([
-      api('/api/posts'),
+    const feedQuery = feedTab === 'following' ? '?feed=following' : '';
+    const [postsData, jobsData, suggestionsData] = await Promise.all([
+      api('/api/posts' + feedQuery),
       api('/api/jobs'),
+      api('/api/users/suggestions?limit=8').catch(() => ({ users: [] })),
     ]);
-    renderFeed(postsData.posts, jobsData.jobs);
+    const sug = (suggestionsData && (suggestionsData.users || suggestionsData.suggestions)) || [];
+    renderFeed(postsData.posts, jobsData.jobs, sug);
   } catch (e) {
-    app.innerHTML = `<div class="empty">${e.message}</div>`;
+    app.innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`;
   }
 }
 
-function renderFeed(posts, jobs) {
+function renderFeed(posts, jobs, suggestions) {
   renderLeftSidebar(posts, jobs);
   renderRightSidebar(posts, jobs);
 
@@ -372,10 +850,10 @@ function renderFeed(posts, jobs) {
   const jobCards = jobs.filter((j) => !j.filled).map(feedJobCard).join('');
   const postCards = posts.length
     ? posts.map(postHtml).join('')
-    : '';
+    : (feedTab === 'following' ? '<div class="empty">You\'re not following anyone with posts yet. Check out “For you”.</div>' : '');
   const list = [jobCards, postCards].filter(Boolean).join('') || '<div class="empty">Nothing here yet. Be the first to share something!</div>';
 
-  app.innerHTML = fab + storiesHtml(posts, jobs) + list;
+  app.innerHTML = fab + storiesHtml(posts, jobs) + feedPillsHtml() + suggestionsHtml(suggestions) + list;
   const fabBtn = $('#fab-new-post');
   if (fabBtn) fabBtn.addEventListener('click', showComposer);
   bindFeed();
@@ -395,7 +873,7 @@ function renderFeed(posts, jobs) {
 function storiesHtml(posts, jobs) {
   const map = new Map();
   posts.forEach((p) => {
-    if (p.author) map.set(p.author.id, { id: p.author.id, name: p.author.name, photo: p.author.photo, hiring: p.author.role === 'owner' });
+    if (p.author) map.set(p.author.id, { id: p.author.id, name: p.author.name, photo: p.author.photo, hiring: p.type === 'offer' || p.type === 'advertisement' });
   });
   jobs.forEach((j) => {
     if (j.giver) map.set(j.giver.id, { id: j.giver.id, name: j.giver.name, photo: j.giver.photo, hiring: true });
@@ -468,7 +946,12 @@ function feedJobCard(j) {
 function postHtml(p) {
   const tag = TYPE_META[p.type] || TYPE_META.general;
   const isOwn = state.me && state.me.id === p.author.id;
-  const hiring = p.author.role === 'owner';
+  const hiring = p.type === 'offer' || p.type === 'advertisement';
+  const sharedFrom = sharedFromHtml(p.sharedFrom);
+  reactCache.set(String(p.id), postReactions(p));
+  seedFollowCache(p.author);
+  const likeInfo = reactionFor(p.id, REACT_ZERO);
+  const saved = !!p.savedByMe;
   return `
     <div class="card post feed-stagger" data-post="${p.id}">
       <div class="card-head">
@@ -479,15 +962,26 @@ function postHtml(p) {
         </div>
         <button class="more-btn"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg></button>
       </div>
-      ${p.body ? `<div class="post-caption">${escapeHtml(p.body)}</div>` : ''}
-      ${p.image ? `<img src="${p.image}" class="post-img" data-lightbox="${p.image}" alt="" />` : ''}
+      ${sharedFrom}
+      ${p.body ? `<div class="post-caption">${renderBodyWithTags(p.body)}</div>` : ''}
+      ${p.image ? `<img src="${escapeHtml(p.image)}" class="post-img" data-lightbox="${escapeHtml(p.image)}" alt="" />` : ''}
+      ${reactionsBarHtml(p.id)}
       <div class="card-actions">
-        <div class="left-actions">
-          <button class="act-btn ${p.likedByMe ? 'liked' : ''}" id="like-${p.id}">
-            <span class="btn-ico">${p.likedByMe ? ICONS.heartFilled : ICONS.heart}</span>
-            <span id="like-count-${p.id}">${p.likeCount}</span>
+        <div class="left-actions" style="position:relative">
+          <button class="react-btn ${likeInfo.active ? 'active' : ''}" id="like-${p.id}" data-action="react" data-post-id="${p.id}" data-emoji="${REACT_ZERO}" aria-pressed="${likeInfo.active ? 'true' : 'false'}" aria-label="${likeInfo.active ? 'Unlike' : 'Like'} this post">
+            <span class="btn-ico">${likeInfo.active ? ICONS.heartFilled : ICONS.heart}</span>
+            <span id="like-count-${p.id}">${Number(likeInfo.count) || 0}</span>
           </button>
+          ${reactionPickerHtml(p.id)}
           <button class="act-btn" id="comment-btn-${p.id}"><span class="btn-ico">${ICONS.comment}</span><span id="comment-count-${p.id}">${p.commentCount}</span></button>
+          <span class="share-wrap">
+            <button class="act-btn" id="share-btn-${p.id}" data-action="share" data-post-id="${p.id}"><span class="btn-ico">${ICONS.share}</span><span class="thumb-count">${Number(p.sharesCount) || 0}</span></button>
+            <div class="share-menu" id="share-menu-${p.id}">
+              <button type="button" data-action="share-feed" data-post-id="${p.id}"><span class="menu-ico">🔁</span> Repost to your feed</button>
+              <button type="button" data-action="share-copy" data-post-id="${p.id}"><span class="menu-ico">🔗</span> Copy link</button>
+            </div>
+          </span>
+          <button class="bookmark-btn ${saved ? 'saved' : ''}" data-action="save" data-post-id="${p.id}" aria-label="${saved ? 'Unsave' : 'Save'} this post" aria-pressed="${saved ? 'true' : 'false'}" title="${saved ? 'Unsave' : 'Save'}"><span class="btn-ico">${saved ? ICONS.bookmarkFilled : ICONS.bookmark}</span></button>
         </div>
         ${isOwn ? `
           <div class="apply-group">
@@ -513,7 +1007,7 @@ function renderLeftSidebar(posts, jobs) {
   if (state.me) {
     const mine = posts.filter((p) => p.author.id === state.me.id);
     const postCount = mine.length;
-    const likeCount = mine.reduce((s, p) => s + p.likeCount, 0);
+    const likeCount = mine.reduce((s, p) => s + postReactions(p).reduce((a, r) => a + r.count, 0), 0);
     const score = postCount + likeCount;
     html = `
       <div class="mini-profile">
@@ -639,15 +1133,6 @@ function bindFeed() {
     img.addEventListener('click', () => showLightbox(img.dataset.lightbox));
   });
 
-  document.querySelectorAll('[id^="like-"]').forEach((btn) => {
-    if (!btn.id.startsWith('like-') || !/^\d+$/.test(btn.id.replace('like-', ''))) return;
-    btn.addEventListener('click', () => {
-      const postId = Number(btn.id.replace('like-', ''));
-      if (!state.me) return requireLogin({ type: 'like', postId }, 'Create an account to like this post.');
-      doLike(postId);
-    });
-  });
-
   document.querySelectorAll('[id^="comment-btn-"]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const postId = Number(btn.id.replace('comment-btn-', ''));
@@ -703,7 +1188,7 @@ function showEditPost(postId) {
     </div>
     ${currentImage ? `
       <div class="edit-image-section" style="margin-top:12px">
-        <img src="${currentImage}" style="width:100%;max-height:200px;object-fit:cover;border-radius:var(--radius-sm);margin-bottom:8px" />
+        <img src="${escapeHtml(currentImage)}" style="width:100%;max-height:200px;object-fit:cover;border-radius:var(--radius-sm);margin-bottom:8px" />
         <button class="btn btn-ghost btn-sm" id="edit-remove-img" style="color:var(--danger)">🗑️ Remove image</button>
       </div>` : ''}
     <div class="preview-wrap hidden" id="edit-post-preview">
@@ -870,17 +1355,145 @@ async function doCreatePost(text, image, type) {
 }
 
 // ---------- Likes / comments ----------
-async function doLike(postId) {
-  const btn = $('#like-' + postId);
-  const wasLiked = btn && btn.textContent.includes('Liked');
-  const data = await api(`/api/posts/${postId}/${wasLiked ? 'unlike' : 'like'}`, { method: 'POST' });
-  const count = $('#like-count-' + postId);
-  if (count) { count.textContent = data.likeCount; count.classList.remove('pop-pop'); void count.offsetWidth; count.classList.add('pop-pop'); }
-  if (btn) {
-    btn.innerHTML = `<span class="btn-ico">${data.liked ? ICONS.heartFilled : ICONS.heart}</span> ${data.liked ? 'Liked' : 'Like'}`;
-    btn.classList.toggle('liked', data.liked);
-    btn.classList.remove('pop-pop'); void btn.offsetWidth; btn.classList.add('pop-pop');
+function bindCommentUsers(box) {
+  box.querySelectorAll('[data-user]').forEach((el) => {
+    el.addEventListener('click', (e) => { e.preventDefault(); goProfile(Number(el.dataset.user)); });
+  });
+}
+
+async function reloadComments(postId) {
+  const box = $('#comments-' + postId);
+  if (!box) return;
+  const data = await api(`/api/posts/${postId}/comments`);
+  renderComments(box, data.comments || [], postId);
+  bindCommentUsers(box);
+}
+
+async function deleteComment(commentId) {
+  const wrap = document.querySelector('[data-comment="' + commentId + '"]');
+  const postCard = wrap && wrap.closest('[data-post]');
+  const postId = postCard ? Number(postCard.dataset.post) : null;
+  await api('/api/comments/' + commentId, { method: 'DELETE' });
+  if (wrap) wrap.remove();
+  if (postId) {
+    const count = $('#comment-count-' + postId);
+    if (count) { const n = parseInt(count.textContent, 10) - 1; count.textContent = Math.max(0, n); }
   }
+  toast('Comment deleted');
+}
+
+function openReplyForm(commentId) {
+  const form = $('#reply-form-' + commentId);
+  if (!form) return;
+  form.hidden = false;
+  const input = $('#reply-input-' + commentId);
+  if (input) input.focus();
+}
+
+function cancelReplyForm(commentId) {
+  const form = $('#reply-form-' + commentId);
+  if (form) form.hidden = true;
+}
+
+async function sendReply(commentId, postId) {
+  if (!state.me) return requireLogin({ type: 'reply', commentId, postId }, 'Create an account to reply.');
+  const input = $('#reply-input-' + commentId);
+  const text = ((input && input.value) || '').trim();
+  if (!text) return;
+  await api('/api/posts/' + postId + '/comments', { method: 'POST', body: JSON.stringify({ body: text, parentId: commentId }) });
+  const box = $('#comments-' + postId);
+  if (box) { box.dataset.loaded = ''; box.classList.remove('hidden'); }
+  await reloadComments(postId);
+  toast('Reply posted');
+}
+
+function commentHtml(c, replyCount, depth, children, postId) {
+  const mine = state.me && c.author.id === state.me.id;
+  const menu = mine ? `
+    <span class="comment-menu-wrap">
+      <button type="button" class="comment-menu-btn" data-action="comment-menu" data-comment-id="${c.id}" aria-label="Comment options" title="More">⋮</button>
+      <div class="comment-menu" id="comment-menu-${c.id}">
+        <button type="button" data-action="comment-edit" data-comment-id="${c.id}">✏️ Edit</button>
+        <button type="button" class="danger" data-action="comment-delete" data-comment-id="${c.id}">🗑️ Delete</button>
+      </div>
+    </span>` : '';
+  const replyBtn = state.me && !depth ? `<button type="button" class="reply-btn" data-action="comment-reply" data-post-id="${postId}" data-comment-id="${c.id}">Reply</button>` : '';
+  const countLabel = replyCount ? `<span class="reply-count">${replyCount} ${replyCount === 1 ? 'reply' : 'replies'}</span>` : '';
+  const replyForm = state.me && !depth ? `
+    <div class="comment-reply-form" id="reply-form-${c.id}" hidden>
+      <input type="text" class="reply-input" id="reply-input-${c.id}" placeholder="Write a reply..." />
+      <button type="button" class="btn btn-primary btn-sm" data-action="comment-reply-send" data-post-id="${postId}" data-comment-id="${c.id}">Reply</button>
+      <button type="button" class="btn btn-ghost btn-sm" data-action="comment-reply-cancel" data-comment-id="${c.id}">Cancel</button>
+    </div>` : '';
+  const editForm = mine ? `
+    <div class="comment-edit-form" id="edit-form-${c.id}" hidden>
+      <input type="text" class="edit-input" id="edit-input-${c.id}" value="${escapeHtml(c.body)}" />
+      <button type="button" class="btn btn-primary btn-sm" data-action="comment-edit-save" data-comment-id="${c.id}">Save</button>
+      <button type="button" class="btn btn-ghost btn-sm" data-action="comment-edit-cancel" data-comment-id="${c.id}">Cancel</button>
+    </div>` : '';
+  const childHtml = (children && children.length) ? `<div class="comment-replies">${children.map((r) => commentHtml(r, 0, depth + 1, [], postId)).join('')}</div>` : '';
+  return `
+    <div class="${depth ? 'comment-reply' : 'comment'}" data-comment="${c.id}">
+      ${avatar(c.author, depth ? 26 : 32)}
+      <div class="comment-bubble">
+        <a href="#" class="comment-author" data-user="${c.author.id}">${escapeHtml(c.author.name)}</a>
+        <div class="comment-text" id="comment-text-${c.id}">${escapeHtml(c.body)}</div>
+        <div class="comment-foot">${replyBtn}${countLabel}${menu}</div>
+        ${replyForm}
+        ${editForm}
+      </div>
+      ${childHtml}
+    </div>`;
+}
+
+function renderComments(box, comments, postId) {
+  const all = (comments || []).filter((c) => c && c.id != null);
+  const top = all.filter((c) => !c.parentId);
+  const replies = new Map();
+  all.forEach((c) => {
+    if (c.parentId) {
+      if (!replies.has(c.parentId)) replies.set(c.parentId, []);
+      replies.get(c.parentId).push(c);
+    }
+  });
+  if (!top.length) {
+    box.innerHTML = '<div style="color:var(--text-soft);font-size:14px;padding:4px 0 8px">No comments yet.</div>';
+    return;
+  }
+  box.innerHTML = top.map((c) => commentHtml(c, (replies.get(c.id) || []).length, 0, replies.get(c.id) || [], postId)).join('');
+}
+
+function openCommentEdit(commentId) {
+  const form = $('#edit-form-' + commentId);
+  if (!form) return;
+  form.hidden = false;
+  const input = $('#edit-input-' + commentId);
+  if (input) { input.focus(); input.select(); }
+}
+
+async function saveCommentEdit(commentId) {
+  const input = $('#edit-input-' + commentId);
+  const text = ((input && input.value) || '').trim();
+  if (!text) return;
+  await api('/api/comments/' + commentId, { method: 'PATCH', body: JSON.stringify({ body: text }) });
+  const txt = $('#comment-text-' + commentId);
+  if (txt) txt.textContent = text;
+  const form = $('#edit-form-' + commentId);
+  if (form) form.hidden = true;
+  toast('Comment updated');
+}
+
+function cancelCommentEdit(commentId) {
+  const form = $('#edit-form-' + commentId);
+  if (form) form.hidden = true;
+}
+
+function toggleCommentMenu(commentId) {
+  const menu = $('#comment-menu-' + commentId);
+  if (!menu) return;
+  const wasOpen = menu.classList.contains('open');
+  document.querySelectorAll('.comment-menu.open').forEach((m) => m.classList.remove('open'));
+  if (!wasOpen) menu.classList.add('open');
 }
 
 async function toggleComments(postId) {
@@ -891,26 +1504,8 @@ async function toggleComments(postId) {
   box.classList.remove('hidden');
   const data = await api(`/api/posts/${postId}/comments`);
   box.dataset.loaded = '1';
-  renderComments(box, data.comments);
-  box.querySelectorAll('[data-user]').forEach((el) => {
-    el.addEventListener('click', (e) => { e.preventDefault(); goProfile(Number(el.dataset.user)); });
-  });
-}
-
-function renderComments(box, comments) {
-  if (!comments.length) {
-    box.innerHTML = '<div style="color:var(--text-soft);font-size:14px;padding:4px 0 8px">No comments yet.</div>';
-    return;
-  }
-  box.innerHTML = comments.map((c) => `
-    <div class="comment">
-      ${avatar(c.author, 32)}
-      <div class="comment-bubble">
-        <a href="#" class="comment-author" data-user="${c.author.id}">${escapeHtml(c.author.name)}</a>
-        <div class="comment-text">${escapeHtml(c.body)}</div>
-      </div>
-    </div>
-  `).join('');
+  renderComments(box, data.comments, postId);
+  bindCommentUsers(box);
 }
 
 async function doComment(postId, presetText) {
@@ -924,7 +1519,7 @@ async function doComment(postId, presetText) {
   state.pendingAction = null;
   const count = $('#comment-count-' + postId);
   if (count) { const n = parseInt(count.textContent, 10) + 1; count.textContent = n; }
-  if (box) { const res = await api(`/api/posts/${postId}/comments`); renderComments(box, res.comments); }
+  if (box) await reloadComments(postId);
 }
 
 // =====================================================================
@@ -977,15 +1572,10 @@ const CHAT_EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '😡', '🎉', '
 let chatReplyTo = null;
 let chatEditId = null;
 let chatTargetUserId = null;
-let chatTypingTimer = null;
 let chatAllMessages = [];
 let chatIsMuted = false;
 let chatIsBlocked = false;
 let chatForwardMsg = null;
-
-function stopChatTyping() {
-  if (chatTypingTimer) { clearInterval(chatTypingTimer); chatTypingTimer = null; }
-}
 
 function formatChatDate(iso) {
   if (!iso) return '';
@@ -1001,18 +1591,37 @@ function formatChatDate(iso) {
 
 function readReceiptHtml(m) {
   if (!m || !m.senderId || !state.me || m.senderId !== state.me.id) return '';
-  if (m.read) return '<span class="chat-read-receipt read"><svg width="16" height="10" viewBox="0 0 16 10" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M1 5.5l3 3 5-6"/><path d="M6 5.5l3 3 5-6"/></svg></span>';
-  if (m.delivered) return '<span class="chat-read-receipt"><svg width="16" height="10" viewBox="0 0 16 10" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M1 5.5l3 3 5-6"/><path d="M6 5.5l3 3 5-6"/></svg></span>';
+  // Server marks messages read via `readAt` (set on GET /api/messages/:userId). No readAt = sent.
+  if (m.readAt) return '<span class="chat-read-receipt read"><svg width="16" height="10" viewBox="0 0 16 10" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M1 5.5l3 3 5-6"/><path d="M6 5.5l3 3 5-6"/></svg></span>';
   return '<span class="chat-read-receipt"><svg width="14" height="10" viewBox="0 0 14 10" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M1 5.5l3 3 5-6"/></svg></span>';
 }
 
 function chatReactionsHtml(m) {
-  if (!m.reactions || !Object.keys(m.reactions).length) return '';
-  const chips = Object.entries(m.reactions).map(([emoji, data]) => {
-    const active = data.userIds && state.me && data.userIds.includes(state.me.id);
-    return `<button class="reaction-chip ${active ? 'active' : ''}" data-msg-id="${m.id}" data-react-emoji="${emoji}">${emoji} <span>${data.count}</span></button>`;
+  // Server sends reactions as an ARRAY of { emoji, userId, userName } — not an object keyed by emoji.
+  const reactions = Array.isArray(m.reactions) ? m.reactions : [];
+  if (!reactions.length) return '';
+  const byEmoji = new Map();
+  reactions.forEach((r) => {
+    if (!r || !r.emoji) return;
+    if (!byEmoji.has(r.emoji)) byEmoji.set(r.emoji, { count: 0, userIds: new Set() });
+    const entry = byEmoji.get(r.emoji);
+    entry.count += 1;
+    if (r.userId) entry.userIds.add(r.userId);
+  });
+  const chips = [...byEmoji.entries()].map(([emoji, data]) => {
+    const active = state.me && data.userIds.has(state.me.id);
+    return `<button class="reaction-chip ${active ? 'active' : ''}" data-msg-id="${m.id}" data-react-emoji="${escapeHtml(emoji)}">${escapeHtml(emoji)} <span>${data.count}</span></button>`;
   }).join('');
   return `<div class="reactions-bar">${chips}</div>`;
+}
+
+function attachmentDisplayName(url) {
+  const u = String(url || '');
+  if (!u) return 'Attachment';
+  let base = u.split('/').pop() || u;
+  // Strip multer's "<timestamp>-<hex>-" prefix so we show a friendlier name.
+  base = base.replace(/^\d+-[0-9a-f]{8}-/i, '');
+  try { return decodeURIComponent(base) || 'Attachment'; } catch (e) { return base || 'Attachment'; }
 }
 
 function chatMsgHtml(m) {
@@ -1027,11 +1636,15 @@ function chatMsgHtml(m) {
   const emojiPickerHtml = `<div class="msg-reaction-picker" data-msg-id="${m.id}">${CHAT_EMOJIS.slice(0, 6).map((e) => `<button data-add-reaction="${m.id}" data-emoji="${e}">${e}</button>`).join('')}</div>`;
 
   let attachmentHtml = '';
-  if (m.image) {
-    attachmentHtml = `<div class="chat-attachment"><img src="${escapeHtml(m.image)}" alt="" onclick="showLightbox('${escapeHtml(m.image)}')" /></div>`;
-  } else if (m.fileUrl) {
-    const fname = m.fileName || 'File';
-    attachmentHtml = `<div class="chat-attachment"><a class="file-link" href="${escapeHtml(m.fileUrl)}" target="_blank" rel="noopener">📎 ${escapeHtml(fname)}</a></div>`;
+  if (m.attachment) {
+    // Server message objects carry `attachment` (a URL string); uploads return { url, name }.
+    const attachUrl = String(m.attachment);
+    const fname = m.attachmentName || attachmentDisplayName(attachUrl);
+    if (/\.(png|jpe?g|gif|webp|bmp|svg)(\?|#|$)/i.test(attachUrl)) {
+      attachmentHtml = `<div class="chat-attachment"><img src="${escapeHtml(attachUrl)}" alt="${escapeHtml(fname)}" onclick="showLightbox('${escapeHtml(attachUrl)}')" /></div>`;
+    } else {
+      attachmentHtml = `<div class="chat-attachment"><a class="file-link" href="${escapeHtml(attachUrl)}" target="_blank" rel="noopener">📎 ${escapeHtml(fname)}</a></div>`;
+    }
   }
 
   if (isDeleted) {
@@ -1102,7 +1715,6 @@ async function goMessages() {
   state.currentView = 'messages';
   setActiveNav('messages');
   document.body.classList.add('narrow');
-  stopChatTyping();
   chatForwardMsg = null;
   app.innerHTML = '<div class="spinner">Loading messages...</div>';
   try {
@@ -1152,7 +1764,7 @@ async function goMessages() {
     });
     viewEnter();
   } catch (e) {
-    app.innerHTML = `<div class="empty">${e.message}</div>`;
+    app.innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`;
   }
 }
 
@@ -1171,11 +1783,6 @@ async function openChat(userId) {
     const otherUser = data.other || { id: userId, name: 'User' };
     chatIsMuted = !!data.muted;
     chatIsBlocked = !!data.blocked;
-
-    const unreadMsgIds = messages.filter((m) => !m.read && m.senderId !== state.me.id).map((m) => m.id);
-    if (unreadMsgIds.length) {
-      api(`/api/messages/read`, { method: 'POST', body: JSON.stringify({ messageIds: unreadMsgIds }) }).catch(() => {});
-    }
 
     app.innerHTML = `
       <div class="chat-view">
@@ -1198,7 +1805,6 @@ async function openChat(userId) {
               <button id="chat-starred-btn">⭐ Starred messages</button>
               <button id="chat-mute-btn">${chatIsMuted ? '🔊 Unmute' : '🔇 Mute'}</button>
               <button id="chat-block-btn" style="color:var(--danger)">${chatIsBlocked ? '✓ Unblock user' : '🚫 Block user'}</button>
-              <button id="chat-clear-btn" style="color:var(--danger)">🗑️ Clear chat</button>
             </div>
           </div>
         </div>
@@ -1283,12 +1889,6 @@ async function openChat(userId) {
       blockUser(userId);
     });
 
-    // Clear chat
-    $('#chat-clear-btn').addEventListener('click', () => {
-      $('#chat-options-menu').classList.remove('open');
-      clearChat(userId);
-    });
-
     // Message actions delegation
     msgBox.addEventListener('click', (e) => {
       // Reaction picker toggle
@@ -1356,13 +1956,10 @@ async function openChat(userId) {
       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMsg(); }
     });
 
-    // Typing indicator polling
-    startTypingPoll(userId);
-
     setTimeout(() => { if (!$('#chat-input')?.disabled) $('#chat-input')?.focus(); }, 50);
     viewEnter();
   } catch (e) {
-    app.innerHTML = `<div class="empty">${e.message}</div>`;
+    app.innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`;
   }
 }
 
@@ -1378,20 +1975,6 @@ function filterChatMessages(query) {
     const text = bubble ? bubble.textContent.toLowerCase() : '';
     el.style.display = text.includes(query) ? '' : 'none';
   });
-}
-
-function startTypingPoll(userId) {
-  stopChatTyping();
-  chatTypingTimer = setInterval(async () => {
-    try {
-      const data = await api(`/api/messages/${userId}/typing`);
-      const ind = $('#typing-indicator');
-      if (ind) {
-        if (data.typing) ind.classList.remove('hidden');
-        else ind.classList.add('hidden');
-      }
-    } catch { /* silent */ }
-  }, 3000);
 }
 
 function toggleInlineReactionPicker(btn, msgId) {
@@ -1416,17 +1999,17 @@ function toggleInlineReactionPicker(btn, msgId) {
 
 async function addReaction(msgId, emoji) {
   try {
+    // Server responds with { reactions: [...] } — an array, not { message: { reactions: {...} } }.
     const data = await api(`/api/messages/${msgId}/react`, { method: 'POST', body: JSON.stringify({ emoji }) });
-    if (data.message) {
-      const msgIdx = chatAllMessages.findIndex((m) => m.id === msgId);
-      if (msgIdx >= 0) chatAllMessages[msgIdx].reactions = data.message.reactions || {};
-      const el = document.querySelector(`[data-msg-id="${msgId}"]`);
-      if (el) {
-        const reactionsContainer = el.querySelector('.reactions-bar');
-        const newHtml = chatReactionsHtml(chatAllMessages[msgIdx] || { reactions: {} });
-        if (reactionsContainer) reactionsContainer.outerHTML = newHtml;
-        else el.querySelector('.chat-msg-content')?.insertAdjacentHTML('beforeend', newHtml);
-      }
+    const reactions = data.reactions || [];
+    const msgIdx = chatAllMessages.findIndex((m) => m.id === msgId);
+    if (msgIdx >= 0) chatAllMessages[msgIdx].reactions = reactions;
+    const el = document.querySelector(`[data-msg-id="${msgId}"]`);
+    if (el) {
+      const reactionsContainer = el.querySelector('.reactions-bar');
+      const newHtml = chatReactionsHtml(msgIdx >= 0 ? chatAllMessages[msgIdx] : { reactions: [] });
+      if (reactionsContainer) reactionsContainer.outerHTML = newHtml;
+      else el.querySelector('.chat-msg-content')?.insertAdjacentHTML('beforeend', newHtml);
     }
   } catch (e) { toast(e.message); }
 }
@@ -1557,9 +2140,11 @@ async function blockUser(userId) {
   const action = chatIsBlocked ? 'unblock' : 'block';
   if (!confirm(chatIsBlocked ? 'Unblock this user?' : 'Block this user? They won\'t be able to message you.')) return;
   try {
-    const data = await api(`/api/messages/${userId}/block`, { method: 'POST' });
-    chatIsBlocked = data.blocked;
-    toast(data.blocked ? 'User blocked' : 'User unblocked');
+    // The real endpoints are POST /api/users/:id/block and POST /api/users/:id/unblock.
+    // The server responds { ok: true }, so flip the client-side state ourselves.
+    await api(`/api/users/${userId}/${action}`, { method: 'POST' });
+    chatIsBlocked = !chatIsBlocked;
+    toast(chatIsBlocked ? 'User blocked' : 'User unblocked');
     const blockBtn = $('#chat-block-btn');
     if (blockBtn) blockBtn.textContent = chatIsBlocked ? '✓ Unblock user' : '🚫 Block user';
     const input = $('#chat-input');
@@ -1569,28 +2154,20 @@ async function blockUser(userId) {
   } catch (e) { toast(e.message); }
 }
 
-async function clearChat(userId) {
-  if (!confirm('Clear all messages in this chat? This cannot be undone.')) return;
-  try {
-    await api(`/api/messages/${userId}/clear`, { method: 'DELETE' });
-    chatAllMessages = [];
-    const msgBox = $('#chat-messages');
-    if (msgBox) msgBox.innerHTML = '<div class="empty" style="border:none;box-shadow:none;padding:40px">No messages yet. Say hello!</div>';
-    toast('Chat cleared');
-  } catch (e) { toast(e.message); }
-}
-
 async function handleChatFileAttach(file, userId) {
   const fd = new FormData();
   fd.append('file', file);
   try {
-    const res = await fetch(`/api/messages/${userId}/upload`, { method: 'POST', body: fd });
-    const data = await res.json();
+    // Real upload endpoint is POST /api/upload — it returns { url, name }.
+    const res = await fetch('/api/upload', { method: 'POST', body: fd });
+    const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || 'Upload failed');
-    const body = { body: '' };
-    if (data.image) body.image = data.image;
-    if (data.fileUrl) { body.fileUrl = data.fileUrl; body.fileName = file.name; }
+    if (!data.url) throw new Error('Upload failed — no file URL returned.');
+    // Attachments travel inside the normal /api/messages/:userId body as `attachment` (a URL string).
+    const body = { body: '', attachment: data.url };
     const msgData = await api(`/api/messages/${userId}`, { method: 'POST', body: JSON.stringify(body) });
+    // The server message only carries the URL; keep the friendly name client-side for display.
+    if (msgData.message) msgData.message.attachmentName = data.name || file.name;
     const msgBox = $('#chat-messages');
     if (msgBox) {
       const emptyMsg = msgBox.querySelector('.empty');
@@ -1736,8 +2313,10 @@ async function doSearch(q, type) {
       : '<div class="empty">No jobs found.</div>';
     bindJobCards(box);
   } else {
-    box.innerHTML = data.results.length
-      ? data.results.map((u) => `
+    const results = data.results || [];
+    results.forEach((u) => seedFollowCache(u));
+    box.innerHTML = results.length
+      ? results.map((u) => `
         <div class="result-card">
           ${avatar(u, 44)}
           <div class="info">
@@ -1746,7 +2325,10 @@ async function doSearch(q, type) {
             ${u.skills.length ? `<div class="result-sub" style="margin-top:4px">Skills: ${u.skills.map(escapeHtml).join(', ')}</div>` : ''}
             ${u.bio ? `<div class="result-sub">${escapeHtml(u.bio)}</div>` : ''}
           </div>
-          <button class="btn btn-primary" data-view-user="${u.id}">View</button>
+          <div style="display:flex;align-items:center;gap:8px;flex-shrink:0">
+            ${state.me ? followBtnHtml(u.id, !!u.followedByMe, u.name) : ''}
+            <button class="btn btn-primary" data-view-user="${u.id}">View</button>
+          </div>
         </div>`).join('')
       : '<div class="empty">No people found.</div>';
     box.querySelectorAll('[data-user]').forEach((el) => {
@@ -1775,6 +2357,7 @@ async function goProfile(userId) {
       : (data.user.skills.length ? data.user.skills.slice(0, 2).join(' · ') : 'Job seeker');
     const memberSince = data.user.createdAt ? new Date(data.user.createdAt).toLocaleDateString('en-US', { month: 'short', year: 'numeric' }) : '';
     const totalEngagement = data.likesReceived + data.commentsReceived + data.postCount;
+    seedFollowCache(data.user);
 
     app.innerHTML = `
       <div class="profile-dash">
@@ -1790,7 +2373,7 @@ async function goProfile(userId) {
               ${data.user.role === 'owner' ? `<div style="margin-top:8px"><span class="pill" style="color:#48566a;background:#e8edf3;border-color:#cbd5e1">Open to hiring</span></div>` : (state.me && state.me.id !== userId ? `<div style="margin-top:8px"><span class="pill" style="color:#48566a;background:#e8edf3;border-color:#cbd5e1">Open to work</span></div>` : '')}
               <div class="profile-actions">
                 ${isMe ? `<button class="btn btn-soft" id="profile-edit-btn"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"></path></svg> Edit profile</button>` : ''}
-                ${!isMe && state.me ? `<button class="btn btn-primary" id="profile-msg-btn">💬 Message</button>` : ''}
+                ${!isMe && state.me ? `${followBtnHtml(userId, !!data.user.isFollowing, data.user.name)} <button class="btn btn-primary" id="profile-msg-btn">💬 Message</button>` : ''}
               </div>
             </div>
           </div>
@@ -1799,6 +2382,10 @@ async function goProfile(userId) {
             <div class="stat"><div class="stat-num">${data.likesReceived}</div><div class="stat-label">Likes</div></div>
             <div class="stat"><div class="stat-num">${data.commentsReceived}</div><div class="stat-label">Comments</div></div>
             ${data.user.role === 'owner' ? `<div class="stat"><div class="stat-num">${data.openJobs}</div><div class="stat-label">Open jobs</div></div>` : ''}
+          </div>
+          <div style="display:flex;gap:10px;padding:0 24px 18px;flex-wrap:wrap">
+            <span class="thumb-count"><b>${data.followersCount != null ? data.followersCount : (data.user.followersCount || 0)}</b> Followers</span>
+            <span class="thumb-count"><b>${data.followingCount != null ? data.followingCount : (data.user.followingCount || 0)}</b> Following</span>
           </div>
         </div>
 
@@ -1845,7 +2432,7 @@ async function goProfile(userId) {
     }
     viewEnter();
   } catch (e) {
-    app.innerHTML = `<div class="empty">${e.message}</div>`;
+    app.innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`;
   }
 }
 
@@ -1902,6 +2489,563 @@ function bindProfileEdit(user) {
       }
     });
   });
+}
+
+// =====================================================================
+// SETTINGS  (Profile, Appearance, Notifications, Privacy, Security, Danger)
+// =====================================================================
+let settingsCache = null;
+let settingsPendingTheme = '';
+
+const THEME_LABELS = [
+  { value: 'light', label: 'Light' },
+  { value: 'dark', label: 'Dark' },
+];
+
+// Applies a theme by setting data-theme on <html>; style.css palettes are
+// defined for dark / high-contrast, and the Meridian :root palette is the
+// light theme. Dark is the app default (no stored/server preference).
+function applyTheme(theme) {
+  const root = document.documentElement;
+  if (theme === 'light') root.removeAttribute('data-theme');
+  else if (theme === 'high-contrast') root.setAttribute('data-theme', 'high-contrast');
+  else root.setAttribute('data-theme', 'dark');
+  try { localStorage.setItem('sf-theme', theme || 'dark'); } catch (e) { /* private mode */ }
+  const resolved = root.getAttribute('data-theme');
+}
+
+function settingsMsg(id, text, ok) {
+  const el = $('#' + id);
+  if (!el) return;
+  el.textContent = text || '';
+  el.classList.remove('hidden');
+  el.classList.toggle('success-text', !!ok);
+  el.classList.toggle('text-danger', !ok);
+}
+
+async function openSettings() {
+  if (!state.me) return showGotcha('Sign in to open Settings.');
+  closePanels();
+  openSheet(`
+    <div class="settings-head" style="margin-bottom:16px">
+      <div>
+        <h2 style="margin-bottom:4px">Settings</h2>
+        <p class="settings-desc" style="margin-bottom:0">Manage your profile, appearance and account.</p>
+      </div>
+      <button class="modal-close" data-action="settings-close" title="Close" aria-label="Close settings">&times;</button>
+    </div>
+    <div id="settings-root"><div class="spinner" style="padding:48px">Loading settings...</div></div>
+  `);
+  try {
+    const data = await api('/api/me/settings');
+    if (!$('#settings-root')) return;
+    settingsCache = data;
+    settingsPendingTheme = data.theme || '';
+    applyTheme(settingsPendingTheme);
+    renderSettings(data);
+    refreshAccountStats();
+    loadAccountInfo();
+  } catch (e) {
+    const root = $('#settings-root');
+    if (root) root.innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function renderSettings(data) {
+  const root = $('#settings-root');
+  if (!root) return;
+  const p = data.profile || {};
+  const skills = Array.isArray(p.skills) ? p.skills.join(', ') : String(p.skills || '');
+  const n = data.notifyPrefs || {};
+  const privateProfile = !!(state.me && state.me.private);
+  const me = state.me || {};
+  const accName = p.name || me.name || '';
+  const accEmail = p.email || me.email || '';
+  const accMemberSince = me.createdAt ? new Date(me.createdAt).toLocaleDateString('en-US', { month: 'short', year: 'numeric' }) : '';
+  const accRole = me.role ? roleLabel(me.role) : '';
+  const themeButtons = (sel) => THEME_LABELS.map((t) => `
+      <button type="button" class="btn btn-sm theme-pick ${t.value === sel ? 'btn-primary' : 'btn-soft'}" data-theme-pick="${t.value}" aria-pressed="${t.value === sel ? 'true' : 'false'}">${t.label}</button>
+    `).join('');
+
+  root.innerHTML = `
+    <div class="settings-section">
+      <div class="settings-head">
+        <div>
+          <h3>Account</h3>
+          <p class="settings-desc">Your profile at a glance. Edit the details in the Profile section below.</p>
+        </div>
+        <button class="btn btn-secondary" data-action="download-data" id="account-download-btn">Download my data</button>
+      </div>
+      <div style="display:flex;align-items:center;gap:14px;margin-bottom:14px">
+        ${avatar(me, 56)}
+        <div style="min-width:0">
+          <div id="acc-display-name" style="font-size:16px;font-weight:700;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml(accName)}</div>
+          <div id="acc-display-email" style="font-size:13px;color:var(--text-soft);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml(accEmail)}</div>
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px" id="acc-stats">
+        <span class="thumb-count"><b>—</b> Followers</span>
+        <span class="thumb-count"><b>—</b> Following</span>
+        <span class="thumb-count"><b>—</b> Posts</span>
+      </div>
+      <div class="card" style="padding:14px 16px;margin-bottom:14px">
+        <h4 style="font-size:14px;font-weight:700;margin:0 0 4px">Account info</h4>
+        <div style="display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px solid var(--border)">
+          <span style="color:var(--text-3);font-size:13px">Member since</span>
+          <span id="acc-member-since" style="color:var(--text);font-size:13px;font-weight:600">${escapeHtml(accMemberSince || '—')}</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px solid var(--border)">
+          <span style="color:var(--text-3);font-size:13px">Email</span>
+          <span id="acc-email" style="color:var(--text);font-size:13px;font-weight:600">${escapeHtml(accEmail || '—')}</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px solid var(--border)">
+          <span style="color:var(--text-3);font-size:13px">Role</span>
+          <span id="acc-role" style="color:var(--text);font-size:13px;font-weight:600">${escapeHtml(accRole || '—')}</span>
+        </div>
+      </div>
+      <p class="form-help">You can download a copy of your data at any time.</p>
+      <p class="form-help hidden" id="set-account-msg" role="status"></p>
+    </div>
+
+    <div class="settings-section">
+      <div class="settings-head">
+        <div>
+          <h3>Profile</h3>
+          <p class="settings-desc">Update the details shown on your public profile.</p>
+        </div>
+        <button class="btn btn-primary" data-action="settings-save-profile">Save changes</button>
+      </div>
+      <div class="form-row">
+        <label class="form-label" for="set-profile-name">Full name</label>
+        <div class="field"><input type="text" id="set-profile-name" value="${escapeHtml(p.name || '')}" autocomplete="name" /></div>
+      </div>
+      <div class="form-row">
+        <label class="form-label" for="set-profile-email">Email</label>
+        <div class="field"><input type="email" id="set-profile-email" value="${escapeHtml(p.email || '')}" autocomplete="email" /></div>
+      </div>
+      <div class="form-row">
+        <label class="form-label" for="set-profile-location">Location</label>
+        <div class="field"><input type="text" id="set-profile-location" value="${escapeHtml(p.location || '')}" placeholder="e.g. Bandra, Mumbai" /></div>
+      </div>
+      <div class="form-row">
+        <label class="form-label" for="set-profile-bio">Bio</label>
+        <div class="field"><textarea id="set-profile-bio" placeholder="A short intro about you, your business or your work.">${escapeHtml(p.bio || '')}</textarea></div>
+      </div>
+      <div class="form-row">
+        <label class="form-label" for="set-profile-skills">Skills</label>
+        <div class="field">
+          <input type="text" id="set-profile-skills" value="${escapeHtml(skills)}" placeholder="Comma separated, e.g. Barista, Driving" />
+          <p class="form-help">Separate each skill with a comma.</p>
+        </div>
+      </div>
+      <p class="form-help hidden" id="set-profile-msg" role="status"></p>
+    </div>
+
+    <div class="settings-section">
+      <div class="settings-head">
+        <div>
+          <h3>Appearance</h3>
+          <p class="settings-desc">Choose how Announce looks. Changes apply instantly and sync to your account.</p>
+        </div>
+        <button class="btn btn-primary" data-action="settings-save-theme">Save theme</button>
+      </div>
+      <div class="form-row">
+        <span class="form-label">Theme</span>
+        <div class="field">
+          <div class="chip-cloud" id="set-theme-picker" role="radiogroup" aria-label="Theme">
+            ${themeButtons(settingsPendingTheme)}
+          </div>
+          <p class="form-help">Your chosen theme is remembered on this device and applied before the page loads.</p>
+        </div>
+      </div>
+      <p class="form-help hidden" id="set-theme-msg" role="status"></p>
+    </div>
+
+    <div class="settings-section">
+      <div class="settings-head">
+        <div>
+          <h3>Notifications</h3>
+          <p class="settings-desc">Choose which activity you want to be notified about.</p>
+        </div>
+        <button class="btn btn-primary" data-action="settings-save-notify">Save preferences</button>
+      </div>
+      <div class="form-row">
+        <span class="form-label">Likes</span>
+        <div class="field">
+          <label class="switch">
+            <input type="checkbox" id="set-notify-likes" ${n.likes ? 'checked' : ''} />
+            <span class="switch-track"></span>
+            <span class="switch-label">When someone likes your post</span>
+          </label>
+        </div>
+      </div>
+      <div class="form-row">
+        <span class="form-label">Comments</span>
+        <div class="field">
+          <label class="switch">
+            <input type="checkbox" id="set-notify-comments" ${n.comments ? 'checked' : ''} />
+            <span class="switch-track"></span>
+            <span class="switch-label">When someone comments on your post</span>
+          </label>
+        </div>
+      </div>
+      <div class="form-row">
+        <span class="form-label">Messages</span>
+        <div class="field">
+          <label class="switch">
+            <input type="checkbox" id="set-notify-messages" ${n.messages ? 'checked' : ''} />
+            <span class="switch-track"></span>
+            <span class="switch-label">When you receive a new message</span>
+          </label>
+        </div>
+      </div>
+      <div class="form-row">
+        <span class="form-label">Applications</span>
+        <div class="field">
+          <label class="switch">
+            <input type="checkbox" id="set-notify-applications" ${n.applications ? 'checked' : ''} />
+            <span class="switch-track"></span>
+            <span class="switch-label">When someone applies to your job</span>
+          </label>
+        </div>
+      </div>
+      <p class="form-help hidden" id="set-notify-msg" role="status"></p>
+    </div>
+
+    <div class="settings-section">
+      <div class="settings-head">
+        <div>
+          <h3>Privacy</h3>
+          <p class="settings-desc">Control who can see your profile.</p>
+        </div>
+        <button class="btn btn-primary" data-action="settings-save-privacy">Save privacy</button>
+      </div>
+      <div class="form-row">
+        <span class="form-label">Private profile</span>
+        <div class="field">
+          <label class="switch">
+            <input type="checkbox" id="set-privacy-private" ${privateProfile ? 'checked' : ''} />
+            <span class="switch-track"></span>
+            <span class="switch-label">Hide my profile from other visitors</span>
+          </label>
+          <p class="form-help">When on, other people only see your name and photo until you connect.</p>
+        </div>
+      </div>
+      <p class="form-help hidden" id="set-privacy-msg" role="status"></p>
+    </div>
+
+    <div class="settings-section">
+      <div class="settings-head">
+        <div>
+          <h3>Security</h3>
+          <p class="settings-desc">Change your account password. It must be at least 8 characters.</p>
+        </div>
+        <button class="btn btn-primary" data-action="settings-save-password">Update password</button>
+      </div>
+      <div class="form-row">
+        <label class="form-label" for="set-pw-current">Current password</label>
+        <div class="field"><input type="password" id="set-pw-current" autocomplete="current-password" /></div>
+      </div>
+      <div class="form-row">
+        <label class="form-label" for="set-pw-new">New password</label>
+        <div class="field"><input type="password" id="set-pw-new" autocomplete="new-password" /><p class="form-help">Minimum 8 characters.</p></div>
+      </div>
+      <div class="form-row">
+        <label class="form-label" for="set-pw-confirm">Confirm new password</label>
+        <div class="field"><input type="password" id="set-pw-confirm" autocomplete="new-password" /></div>
+      </div>
+      <p class="form-help hidden" id="set-pw-msg" role="status"></p>
+    </div>
+
+    <div class="danger-zone">
+      <h3>Delete account</h3>
+      <p class="settings-desc">Permanently delete your account, posts, applications and conversations. This cannot be undone.</p>
+      <div id="danger-box">
+        <button class="btn btn-danger-solid" data-action="settings-danger-step1">Delete account</button>
+      </div>
+    </div>
+  `;
+}
+
+function updateThemeChips(sel) {
+  document.querySelectorAll('#set-theme-picker .theme-pick').forEach((b) => {
+    const active = b.dataset.themePick === sel;
+    b.classList.toggle('btn-primary', active);
+    b.classList.toggle('btn-soft', !active);
+    b.setAttribute('aria-pressed', active ? 'true' : 'false');
+  });
+}
+
+function pickTheme(theme) {
+  settingsPendingTheme = theme;
+  applyTheme(theme);
+  updateThemeChips(theme);
+  const msg = $('#set-theme-msg');
+  if (msg) msg.classList.add('hidden');
+}
+
+async function saveSettingsProfile() {
+  if (!state.me) return;
+  const btn = document.querySelector('[data-action="settings-save-profile"]');
+  const nameEl = $('#set-profile-name');
+  if (!nameEl) return;
+  const name = nameEl.value.trim();
+  if (!name) return settingsMsg('set-profile-msg', 'Name cannot be empty.', false);
+  const email = $('#set-profile-email') ? $('#set-profile-email').value.trim() : '';
+  const location = $('#set-profile-location') ? $('#set-profile-location').value.trim() : '';
+  const bio = $('#set-profile-bio') ? $('#set-profile-bio').value : '';
+  const skills = ($('#set-profile-skills') ? $('#set-profile-skills').value : '').split(',').map((s) => s.trim()).filter(Boolean);
+  if (btn) btn.disabled = true;
+  try {
+    const data = await api(`/api/users/${state.me.id}`, { method: 'PATCH', body: JSON.stringify({ name, email, bio, location, skills }) });
+    state.me = data.user;
+    renderAuth();
+    const accNameEl = $('#acc-display-name');
+    const accEmailEl = $('#acc-display-email');
+    if (accNameEl) accNameEl.textContent = state.me.name || '';
+    if (accEmailEl) accEmailEl.textContent = state.me.email || '';
+    settingsMsg('set-profile-msg', 'Profile updated.', true);
+    if (state.currentView === 'profile' && state.profileUserId === state.me.id) goProfile(state.me.id);
+  } catch (e) {
+    settingsMsg('set-profile-msg', e.message, false);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function saveSettingsTheme() {
+  const btn = document.querySelector('[data-action="settings-save-theme"]');
+  const theme = settingsPendingTheme || '';
+  if (btn) btn.disabled = true;
+  try {
+    await api('/api/me/settings', { method: 'POST', body: JSON.stringify({ theme }) });
+    if (settingsCache) settingsCache.theme = theme;
+    if (state.me) state.me.theme = theme;
+    settingsMsg('set-theme-msg', 'Theme saved.', true);
+  } catch (e) {
+    const serverTheme = settingsCache ? settingsCache.theme || '' : '';
+    settingsPendingTheme = serverTheme;
+    applyTheme(serverTheme);
+    updateThemeChips(serverTheme);
+    settingsMsg('set-theme-msg', e.message, false);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function saveSettingsNotify() {
+  const btn = document.querySelector('[data-action="settings-save-notify"]');
+  if (!$('#set-notify-likes')) return;
+  const notifyPrefs = {
+    likes: $('#set-notify-likes').checked,
+    comments: $('#set-notify-comments').checked,
+    messages: $('#set-notify-messages').checked,
+    applications: $('#set-notify-applications').checked,
+  };
+  if (btn) btn.disabled = true;
+  try {
+    await api('/api/me/settings', { method: 'POST', body: JSON.stringify({ notifyPrefs }) });
+    if (settingsCache) settingsCache.notifyPrefs = notifyPrefs;
+    if (state.me) state.me.notifyPrefs = notifyPrefs;
+    settingsMsg('set-notify-msg', 'Notification preferences saved.', true);
+  } catch (e) {
+    settingsMsg('set-notify-msg', e.message, false);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function saveSettingsPrivacy() {
+  const btn = document.querySelector('[data-action="settings-save-privacy"]');
+  const sw = $('#set-privacy-private');
+  if (!sw) return;
+  const privateProfile = sw.checked;
+  if (btn) btn.disabled = true;
+  try {
+    await api('/api/me/settings', { method: 'POST', body: JSON.stringify({ privateProfile }) });
+    if (state.me) state.me.private = privateProfile;
+    settingsMsg('set-privacy-msg', privateProfile ? 'Your profile is now private.' : 'Your profile is now public.', true);
+  } catch (e) {
+    settingsMsg('set-privacy-msg', e.message, false);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function saveSettingsPassword() {
+  const btn = document.querySelector('[data-action="settings-save-password"]');
+  const current = $('#set-pw-current');
+  const fresh = $('#set-pw-new');
+  const confirm = $('#set-pw-confirm');
+  if (!current || !fresh || !confirm) return;
+  const currentPassword = current.value;
+  const password = fresh.value;
+  if (!currentPassword) return settingsMsg('set-pw-msg', 'Enter your current password.', false);
+  if (password.length < 8) return settingsMsg('set-pw-msg', 'New password must be at least 8 characters.', false);
+  if (password !== confirm.value) return settingsMsg('set-pw-msg', 'New passwords do not match.', false);
+  if (btn) btn.disabled = true;
+  try {
+    await api('/api/me/password', { method: 'POST', body: JSON.stringify({ currentPassword, password }) });
+    current.value = '';
+    fresh.value = '';
+    confirm.value = '';
+    settingsMsg('set-pw-msg', 'Password updated.', true);
+  } catch (e) {
+    settingsMsg('set-pw-msg', e.message, false);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+function revealDangerConfirm() {
+  const box = $('#danger-box');
+  if (!box) return;
+  box.innerHTML = `
+    <div class="field">
+      <input type="text" id="danger-confirm-input" placeholder="Type CONFIRM to delete your account" autocomplete="off" />
+      <p class="form-help">This permanently deletes your account, posts, applications and conversations.</p>
+    </div>
+    <div style="display:flex;gap:10px;margin-top:12px;flex-wrap:wrap">
+      <button class="btn btn-ghost" data-action="settings-danger-cancel">Cancel</button>
+      <button class="btn btn-danger-solid" data-action="settings-delete-confirm" id="danger-delete-btn" disabled>Permanently delete account</button>
+    </div>
+  `;
+  const input = $('#danger-confirm-input');
+  input.addEventListener('input', () => {
+    const del = $('#danger-delete-btn');
+    if (del) del.disabled = (input.value !== 'CONFIRM');
+  });
+  input.focus();
+}
+
+function closeDangerConfirm() {
+  const box = $('#danger-box');
+  if (!box) return;
+  box.innerHTML = '<button class="btn btn-danger-solid" data-action="settings-danger-step1">Delete account</button>';
+}
+
+async function deleteAccount() {
+  const btn = $('#danger-delete-btn');
+  if (btn) btn.disabled = true;
+  try {
+    await api('/api/me', { method: 'DELETE' });
+    state.me = null;
+    settingsCache = null;
+    settingsPendingTheme = '';
+    stopNotifPoll();
+    closePanels();
+    closeSheet();
+    renderAuth();
+    goFeed();
+    toast('Account deleted. Sorry to see you go.');
+  } catch (e) {
+    let msgEl = $('#danger-msg');
+    if (!msgEl) {
+      const box = $('#danger-box');
+      if (box) {
+        msgEl = document.createElement('p');
+        msgEl.id = 'danger-msg';
+        msgEl.className = 'form-help text-danger';
+        box.appendChild(msgEl);
+      }
+    }
+    if (msgEl) msgEl.textContent = e.message;
+  }
+}
+
+// ---------- Account: header menu helpers + data export ----------
+function roleLabel(role) {
+  return role === 'owner' ? 'Business' : 'Individual';
+}
+
+function accountHandle(user) {
+  const role = user && user.role;
+  return role === 'owner' ? 'business' : 'job-seeker';
+}
+
+function slugForFilename(str) {
+  return String(str || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '') || 'user';
+}
+
+async function downloadMyData() {
+  if (!state.me) return;
+  const btns = document.querySelectorAll('[data-action="download-data"]');
+  const labels = new Map();
+  btns.forEach((b) => { labels.set(b, b.innerHTML); b.disabled = true; b.innerHTML = 'Preparing your data…'; });
+  try {
+    const data = await api('/api/me/data'); // full data export (backend agent)
+    const uname = slugForFilename(state.me.username || state.me.name);
+    const dateStr = new Date().toISOString().slice(0, 10);
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `announce-export-${uname}-${dateStr}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    toast('Your data export is ready.');
+  } catch (e) {
+    toast(e.message || 'Could not download your data.');
+  } finally {
+    btns.forEach((b) => { b.disabled = false; b.innerHTML = labels.get(b) || 'Download my data'; });
+  }
+}
+
+async function refreshAccountStats() {
+  const wrap = $('#acc-stats');
+  if (!wrap) return;
+  let followers = null;
+  let following = null;
+  let posts = null;
+  const absorb = (u) => {
+    if (!u) return;
+    if (followers == null) followers = u.followersCount != null ? u.followersCount : (u.followers != null ? u.followers : null);
+    if (following == null) following = u.followingCount != null ? u.followingCount : (u.following != null ? u.following : null);
+    if (posts == null) posts = u.postsCount != null ? u.postsCount : (u.postCount != null ? u.postCount : null);
+  };
+  absorb(state.me);
+  try {
+    const meData = await api('/api/me');
+    absorb(meData.user || meData);
+  } catch (e) { /* fall back to cached state.me */ }
+  if (posts == null && state.me && state.me.id != null) {
+    try {
+      const prof = await api('/api/users/' + state.me.id);
+      absorb(prof.user || prof);
+    } catch (e) { /* keep dash */ }
+  }
+  wrap.innerHTML = `
+    <span class="thumb-count"><b>${escapeHtml(followers != null ? String(followers) : '—')}</b> Followers</span>
+    <span class="thumb-count"><b>${escapeHtml(following != null ? String(following) : '—')}</b> Following</span>
+    <span class="thumb-count"><b>${escapeHtml(posts != null ? String(posts) : '—')}</b> Posts</span>
+  `;
+}
+
+async function loadAccountInfo() {
+  const emailEl = $('#acc-email');
+  const sinceEl = $('#acc-member-since');
+  const roleEl = $('#acc-role');
+  if (!emailEl && !sinceEl && !roleEl) return;
+  let u = null;
+  try {
+    const res = await api('/api/me/account'); // account info (backend agent)
+    u = res.account || res.user || res;
+  } catch (e) { /* not available yet — fall back to /api/me payload */ }
+  if (!u || !u.email) {
+    try {
+      const meData = await api('/api/me');
+      u = u || (meData.user || meData);
+    } catch (e2) { /* keep cached state.me below */ }
+  }
+  const info = u || state.me || {};
+  if (emailEl) emailEl.textContent = info.email ? String(info.email) : '—';
+  if (sinceEl) sinceEl.textContent = info.createdAt ? new Date(info.createdAt).toLocaleDateString('en-US', { month: 'short', year: 'numeric' }) : '—';
+  if (roleEl) roleEl.textContent = info.role ? roleLabel(info.role) : '—';
 }
 
 // =====================================================================
@@ -2326,14 +3470,17 @@ function loadMapJobs() {
     });
     const count = $('#map-count');
     if (count) count.textContent = data.jobs.length + ' job' + (data.jobs.length !== 1 ? 's' : '') + ' shown';
+    // /api/jobs/map returns { jobs } only — no `categories` array. Derive categories from the jobs.
     const cats = $('#map-category');
-    if (cats && cats.options.length <= 1 && data.categories.length) {
-      data.categories.forEach((c) => { const o = document.createElement('option'); o.value = c; o.textContent = c; cats.appendChild(o); });
+    if (cats && cats.options.length <= 1) {
+      const seen = new Set();
+      (data.jobs || []).forEach((j) => { if (j.category) seen.add(j.category); });
+      [...seen].sort().forEach((c) => { const o = document.createElement('option'); o.value = c; o.textContent = c; cats.appendChild(o); });
     }
     if (mapMarkers.getLayers().length > 0) {
       mapInstance.fitBounds(mapMarkers.getBounds().pad(0.15));
     }
-  }).catch(() => toast('Failed to load map jobs.'));
+  }).catch(() => { if (mapMarkers && mapMarkers.getLayers().length === 0) toast('Failed to load map jobs.'); });
 }
 
 function closeMapPopup() { if (mapInstance) mapInstance.closePopup(); }
@@ -2443,6 +3590,9 @@ function refreshView() {
   else if (state.currentView === 'search') goSearch();
   else if (state.currentView === 'messages' || state.currentView === 'chat') goMessages();
   else if (state.currentView === 'map') goMap();
+  else if (state.currentView === 'saved') goSaved();
+  else if (state.currentView === 'events') goEvents();
+  else if (state.currentView === 'tag' && state.pendingTag) loadTag(state.pendingTag);
   else loadFeed();
 }
 
@@ -2456,7 +3606,57 @@ document.querySelectorAll('[data-nav]').forEach((el) => {
     else if (nav === 'jobs') goJobs('browse');
     else if (nav === 'map') goMap();
     else if (nav === 'messages') goMessages();
+    else if (nav === 'saved') goSaved();
+    else if (nav === 'events') goEvents();
   });
+});
+
+// ---------- Settings: delegated actions (attach once) ----------
+document.addEventListener('click', (e) => {
+  const picker = e.target.closest('[data-theme-pick]');
+  if (picker) { e.preventDefault(); pickTheme(picker.dataset.themePick); return; }
+
+  const insidePopover = !!e.target.closest('.share-menu, .comment-menu');
+  if (!insidePopover) {
+    document.querySelectorAll('.share-menu.open, .comment-menu.open').forEach((m) => m.classList.remove('open'));
+  }
+
+  const el = e.target.closest('[data-action]');
+  if (!el) return;
+  const action = el.dataset.action;
+  if (action === 'open-settings') { e.preventDefault(); openSettings(); }
+  else if (action === 'settings-close') { e.preventDefault(); closeSheet(); }
+  else if (action === 'settings-save-profile') { e.preventDefault(); saveSettingsProfile(); }
+  else if (action === 'settings-save-theme') { e.preventDefault(); saveSettingsTheme(); }
+  else if (action === 'settings-save-notify') { e.preventDefault(); saveSettingsNotify(); }
+  else if (action === 'settings-save-privacy') { e.preventDefault(); saveSettingsPrivacy(); }
+  else if (action === 'settings-save-password') { e.preventDefault(); saveSettingsPassword(); }
+  else if (action === 'settings-danger-step1') { e.preventDefault(); revealDangerConfirm(); }
+  else if (action === 'settings-danger-cancel') { e.preventDefault(); closeDangerConfirm(); }
+  else if (action === 'settings-delete-confirm') { e.preventDefault(); deleteAccount(); }
+  else if (action === 'download-data') { e.preventDefault(); downloadMyData(); }
+  else if (action === 'feed-tab') { e.preventDefault(); feedTab = el.dataset.feed === 'following' ? 'following' : 'for-you'; goFeed(); }
+  else if (action === 'react') { e.preventDefault(); quickReact(Number(el.dataset.postId), el.dataset.emoji); }
+  else if (action === 'react-chip') { e.preventDefault(); quickReact(Number(el.dataset.postId), el.dataset.emoji); }
+  else if (action === 'share') { e.preventDefault(); toggleShareMenu(Number(el.dataset.postId)); }
+  else if (action === 'share-feed') { e.preventDefault(); doShareToFeed(Number(el.dataset.postId)); }
+  else if (action === 'share-copy') { e.preventDefault(); doShareCopy(Number(el.dataset.postId)); }
+  else if (action === 'save') { e.preventDefault(); toggleSavePost(Number(el.dataset.postId)); }
+  else if (action === 'tag') { e.preventDefault(); loadTag(el.dataset.tag); }
+  else if (action === 'tag-clear') { e.preventDefault(); state.pendingTag = null; goFeed(); }
+  else if (action === 'comment-reply') { e.preventDefault(); openReplyForm(Number(el.dataset.commentId)); }
+  else if (action === 'comment-reply-send') { e.preventDefault(); sendReply(Number(el.dataset.commentId), Number(el.dataset.postId)); }
+  else if (action === 'comment-reply-cancel') { e.preventDefault(); cancelReplyForm(Number(el.dataset.commentId)); }
+  else if (action === 'comment-menu') { e.preventDefault(); toggleCommentMenu(Number(el.dataset.commentId)); }
+  else if (action === 'comment-edit') { e.preventDefault(); openCommentEdit(Number(el.dataset.commentId)); }
+  else if (action === 'comment-edit-save') { e.preventDefault(); saveCommentEdit(Number(el.dataset.commentId)); }
+  else if (action === 'comment-edit-cancel') { e.preventDefault(); cancelCommentEdit(Number(el.dataset.commentId)); }
+  else if (action === 'comment-delete') { e.preventDefault(); deleteComment(Number(el.dataset.commentId)); }
+  else if (action === 'follow') { e.preventDefault(); toggleFollow(Number(el.dataset.userId), el); }
+  else if (action === 'event-create-open') { e.preventDefault(); showCreateEvent(); }
+  else if (action === 'event-create-close') { e.preventDefault(); closeSheet(); }
+  else if (action === 'event-rsvp') { e.preventDefault(); rsvpEvent(Number(el.dataset.eventId)); }
+  else if (action === 'event-delete') { e.preventDefault(); if (confirm('Delete this event?')) deleteEvent(Number(el.dataset.eventId)); }
 });
 
 // ---------- Init ----------
@@ -2472,6 +3672,9 @@ document.addEventListener('click', (e) => {
 (async function init() {
   const data = await api('/api/me');
   state.me = data.user;
+  // Server theme is the source of truth when signed in; localStorage was the
+  // pre-paint fast path, and this re-syncs (and re-persists) the saved value.
+  if (state.me && typeof state.me.theme === 'string') applyTheme(state.me.theme);
   renderAuth();
   goFeed();
   if (state.me) pollNotifications();

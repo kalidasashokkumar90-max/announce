@@ -4,7 +4,24 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>ANNOUNCE</title>
-  <link rel="stylesheet" href="style.css?v=2" />
+  <script>
+    // Apply saved theme BEFORE first paint (fast path; the server value
+    // in app.js is the source of truth once the app boots). Dark is the
+    // default when nothing is stored.
+    (function () {
+      try {
+        var t = localStorage.getItem('sf-theme');
+        if (t === 'light') {
+          document.documentElement.removeAttribute('data-theme');
+        } else if (t === 'high-contrast') {
+          document.documentElement.setAttribute('data-theme', 'high-contrast');
+        } else {
+          document.documentElement.setAttribute('data-theme', 'dark');
+        }
+      } catch (e) {}
+    })();
+  </script>
+  <link rel="stylesheet" href="style.css?v=9" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
@@ -15,18 +32,25 @@
   <header class="topbar">
     <div class="topbar-inner">
       <div class="nav-left-part">
-        <a href="#" class="brand" data-nav="feed" title="Home" aria-label="Announce home">
-          <img src="logo.png" alt="ANNOUNCE" style="height:48px;vertical-align:middle" />
+<a href="#" class="brand" data-nav="feed" title="Home" aria-label="Announce home">
+          <img src="logo-light.png" alt="" class="logo logo-light" />
+          <img src="logo-dark.png" alt="" class="logo logo-dark" />
+          <span class="wordmark">ANNOUNCE</span>
         </a>
         <nav class="main-nav">
           <a href="#" data-nav="jobs" id="nav-jobs" class="nav-link">Jobs</a>
           <a href="#" data-nav="map" id="nav-map" class="nav-link">Map</a>
           <a href="#" data-nav="messages" id="nav-messages" class="nav-link">Messages</a>
+          <a href="#" data-nav="saved" id="nav-saved" class="nav-link">Saved</a>
+          <a href="#" data-nav="events" id="nav-events" class="nav-link">Events</a>
         </nav>
       </div>
       <div class="actions" id="nav-right">
         <button class="icon-btn" id="nav-search-btn" data-nav="search" title="Search" aria-label="Search">
           <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"></circle><path d="M21 21l-4.3-4.3"></path></svg>
+        </button>
+        <button class="icon-btn hidden" id="nav-settings-btn" data-action="open-settings" title="Settings" aria-label="Settings">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
         </button>
         <div id="auth-zone"></div>
       </div>
@@ -80,11 +104,11 @@
     <div class="modal wide" id="sheet-body"></div>
   </div>
 
-  <div id="toast" class="toast hidden">
+  <div id="toast" class="toast hidden" role="status" aria-live="polite">
     <div class="tick">✓</div>
     <span id="toast-text"></span>
   </div>
 
-  <script src="app.js?v=2"></script>
+  <script src="app.js?v=9"></script>
 </body>
 </html>
