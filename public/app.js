@@ -579,7 +579,7 @@ function showLightbox(src) {
 }
 
 function setActiveNav(view) {
-  document.querySelectorAll('.main-nav a').forEach((a) => a.classList.toggle('active', a.dataset.nav === view));
+  document.querySelectorAll('.main-nav a, .mobile-nav a').forEach((a) => a.classList.toggle('active', a.dataset.nav === view));
 }
 
 // ---------- Auth ----------

@@ -2039,7 +2039,8 @@ body.narrow .col-left, body.narrow .col-right { display: none; }
   .topbar-inner { padding: 10px 14px; gap: 10px; }
   .nav-left-part { gap: 14px; }
   .main-nav a { padding: 8px 12px; font-size: 13.5px; }
-  .shell { padding: 16px 12px 80px; gap: 0; }
+  .main-nav { display: none; }
+  .shell { padding: 16px 12px 100px; gap: 0; }
   .name-sm { display: none; }
   .avatar-mini { padding: 4px; }
   .notif-panel { right: -70px; width: 300px; }
@@ -2057,7 +2058,7 @@ body.narrow .col-left, body.narrow .col-right { display: none; }
   .type-picker { grid-template-columns: repeat(3, minmax(0,1fr)); }
   .card-actions { flex-wrap: wrap; gap: 8px; }
   .chat-msg { max-width: 88%; }
-  .fab { bottom: 18px; right: 18px; }
+  .fab { bottom: 96px; right: 16px; }
   .toast { width: calc(100% - 32px); justify-content: center; }
 
   /* Settings layout stacks to one column on phones */
