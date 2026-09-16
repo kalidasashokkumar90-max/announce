@@ -146,8 +146,17 @@ function invalidateOtherSessions(userId, keepToken) {
 // Google Cloud console; add APP_URL to your Google "Authorized redirect URIs"
 // as <APP_URL>/api/auth/google/callback). When unset the feature is disabled
 // and the UI simply hides the button.
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
-const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
+// Credentials can also be placed in a small JSON file next to the database
+// (GOOGLE_SECRETS_FILE, default <db dir>/secrets.json) — handy for platforms
+// where env vars can only be set from a dashboard. Env vars always win.
+const secretsFile = process.env.GOOGLE_SECRETS_FILE || path.join(path.dirname(process.env.DB_PATH || path.join(__dirname, 'data', 'announce.db')), 'secrets.json');
+let fileGoogleCreds = {};
+try {
+  const parsed = JSON.parse(fs.readFileSync(secretsFile, 'utf8'));
+  fileGoogleCreds = parsed && typeof parsed === 'object' ? parsed : {};
+} catch (e) { /* no file — env-only mode */ }
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || fileGoogleCreds.GOOGLE_CLIENT_ID || fileGoogleCreds.client_id || '';
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || fileGoogleCreds.GOOGLE_CLIENT_SECRET || fileGoogleCreds.client_secret || '';
 const GOOGLE_REDIRECT_URI = `${APP_URL}/api/auth/google/callback`;
 
 // CSRF guard state for the OAuth round-trip (one-time, 10-minute expiry).
