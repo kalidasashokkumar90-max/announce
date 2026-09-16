@@ -1,0 +1,19 @@
+name: Fix malformed Railway variables
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  fix-variables:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Replace all service variables cleanly
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+        run: |
+          curl -fsS -X POST https://backboard.railway.com/graphql/v2 \
+            -H "Authorization: Bearer ${RAILWAY_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data-raw '{"query":"mutation($input:VariableCollectionUpsertInput!){variableCollectionUpsert(input:$input)}","variables":{"input":{"projectId":"fd621770-5277-4777-a6ac-b8e8b7755688","environmentId":"8b183f8a-2af5-4c73-aeab-6618cfb65fd3","serviceId":"84e1ac30-0dd4-4a5f-8e92-cf11afe4dd46","replace":true,"variables":{"NODE_ENV":"production","SESSION_SECRET":"vk-9QzT2Pk7mRnX4dWcVhJbLgNf8sA6eD3","DB_PATH":"/data/announce.db","UPLOAD_DIR":"/data/uploads","GOOGLE_CLIENT_ID":"'"${GOOGLE_CLIENT_ID}"'","GOOGLE_CLIENT_SECRET":"'"${GOOGLE_CLIENT_SECRET}"'"}}}}'
