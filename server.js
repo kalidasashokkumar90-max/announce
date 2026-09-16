@@ -157,6 +157,7 @@ try {
 } catch (e) { /* no file — env-only mode */ }
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || fileGoogleCreds.GOOGLE_CLIENT_ID || fileGoogleCreds.client_id || '';
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || fileGoogleCreds.GOOGLE_CLIENT_SECRET || fileGoogleCreds.client_secret || '';
+console.log(`Google sign-in: ${GOOGLE_CLIENT_ID ? 'enabled' : 'disabled (no credentials)'} [secrets files: ${secretsFile}]`);
 const GOOGLE_REDIRECT_URI = `${APP_URL}/api/auth/google/callback`;
 
 // CSRF guard state for the OAuth round-trip (one-time, 10-minute expiry).
